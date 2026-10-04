@@ -35,7 +35,8 @@ event/
         ├── ScheduleView.vue     # 赛程编排（自动对阵 + 淘汰推进）
         ├── ScoreView.vue        # 成绩录入
         ├── BracketView.vue      # 对阵与积分榜
-        ├── RegistrationView.vue # 报名与资格审核（提交/审核/退报/撤销）
+        ├── RegistrationView.vue # 报名与资格审核（提交/审核/退报/撤销，回显入场核验结果）
+        ├── AccessView.vue       # 赛事证件与入场核验（扫码核验/证件管理/场次入场/流水/异常审计）
         ├── AppealView.vue       # 赛事申诉复核（单位异议/受理改判/驳回，联动积分奖牌淘汰赛）
         ├── TeamView.vue         # 队伍与运动员
         ├── VenueView.vue        # 场地与裁判
@@ -71,6 +72,11 @@ npm run dev      # 后端 4170 + 前端 5203
 | `registrations` | 参赛报名与资格审核（kind：team/athlete，状态流转 pending→approved/rejected，退报 withdrawn / 撤销 revoked，含名额序号 quota_no、审核人与备注） |
 | `appeals` | 赛事申诉单（编号 SS-xxxx；target_type：match 球类比分 / track 田径成绩 / eligibility 参赛资格；状态 pending 待受理 → reviewing 复核中 → upheld 改判 / rejected 驳回，或 withdrawn 撤案；resolution 与 impact 记录改判结论及影响汇总） |
 | `appeal_logs` | 申诉全量审计（submit/accept/reject/withdraw/uphold，含人类可读详情、变更前后快照 JSON 与经办人，按申诉单串联时间线） |
+| `venue_staff` | 场地工作人员（岗位 role：场地主管/医疗/安保/器材/媒体/志愿者 + 服务场地，状态 在岗/离岗） |
+| `badges` | 赛事证件（编号 T/A/R/S-xxxx，主体 team/athlete/referee/staff；`zones` 授权区域快照；status active/blocked，`block_manual` 标记人工暂扣） |
+| `access_checkins` | 入场核验流水（pass/deny/forced_pass；is_duplicate 同日同场幂等；reason_code 拒绝原因码；回写各域的唯一数据源） |
+| `access_logs` | 证件与入场异常审计（issue/sync/block/unblock/deny/force_pass，severity info/warn/danger，含原因与经办人） |
+| — | **回写字段**：`registrations.last_checkin_at/result`（报名）、`assignments.checkin_at`（排班）、`matches.checkin_a_at/checkin_b_at/checkin_crew/checkin_crew_total/admission_denied`（比赛） |
 
 ## 核心算法
 
@@ -105,6 +111,26 @@ npm run dev      # 后端 4170 + 前端 5203
 - **🪪 资格改判**：复用资格撤销级联（未赛判弃权 3:0、已赛取消成绩、足球小组按新排名递补半决赛、统一淘汰赛 reconcile、田径删除成绩重排名）。
 
 每次改判前后均抓取**奖牌快照与积分榜快照**，把单位级奖牌增减（金/银/铜 ±n）、队伍积分与名次变化连同回写明细、重赛/递补场次写入 `appeals.impact` 与 `appeal_logs`；比分类改判同时在 `assignment_logs` 留痕（`match_change`）。侧边导航对「待受理+复核中」数量显示角标，总览页展示待办申诉，报表中心提供改判审计表。
+
+## 赛事证件与入场核验（🪪 证件核验页）
+
+运动员（队伍/田径单项）、裁判、场地工作人员人手一证（编号前缀 **T/A/R/S**，如 `T-0001`），入场口扫码后系统按**资格 + 赛程实时计算动态权限**，不存在永久通行证：
+
+- **队伍**：资格 `approved` + 该场确为其赛程（必须是对阵双方）+ 核验场地与比赛场地一致 + 场次处于待赛状态；不指定场次时自动匹配其最近一场待赛。
+- **田径运动员**：项目资格有效 + 核验场地为其项目场地（无对阵赛程，按检录口径放行）。
+- **裁判**：必须在当前场次（或当前时段）的**在派执法名单**中（按排班入场），并携带主裁/助理/记录台角色；场地须与执法场次一致。
+- **场地工作人员**：按**岗位 + 服务场地**授权，不依赖赛程——场地主管/医疗/安保→比赛区+工作区，器材→热身区+工作区，媒体→媒体区，志愿者→工作区。
+
+**授权区域（zones）**随资格/岗位/赛程动态生成并在证件上留存快照；资格未生效（待审核/驳回）、退报、撤销资格、人员离岗时证件自动停用并收回区域；资格恢复自动激活。组委会可**人工暂扣**违纪证件（`block_manual`，资格恢复也不会自动解停，须人工解除）。服务启动时与 `POST /api/badges/sync` 提供全量证件同步（幂等，旧库自动补发）。
+
+**核验结果四类**：✅ 放行、⛔ 拒绝（原因码 `BADGE_NOT_FOUND`/`BADGE_BLOCKED`/`NO_FIXTURE`/`WRONG_VENUE`/`NOT_ASSIGNED`/`MATCH_NOT_PLAYABLE`）、⚠️ **强制放行**（值班主任必填原因留痕，计入异常审计）、🔁 重复核验（同证同日同场重复扫码返回首次结果，不重复回写）。全部判定在 `BEGIN IMMEDIATE` 单事务中完成。
+
+**核验结果回写四域**（核验流水是唯一写入方）：
+
+- **报名**：`registrations.last_checkin_at / last_checkin_result`（已核验/强制放行），报名审核页直接回显。
+- **排班**：裁判签到写 `assignments.checkin_at`；调班/解除/对调时同步刷新场次到岗计数，避免旧签到残留。
+- **比赛**：`matches.checkin_a_at/checkin_b_at`（双方到场）、`checkin_crew/checkin_crew_total`（执法到岗）、`admission_denied`（异常拦截计数）；场次取消/重赛/改判回退时清空到场数据重新核验。成绩录入页与赛程页显示到场/到岗/异常状态。
+- **异常审计**：拒绝与强制放行写入 `access_logs`（severity danger/warn），证件发放/同步/暂扣/解除全量留痕；侧边导航对「今日拦截+强制放行」显示角标，报表中心提供异常原因分布与场次到场/到岗审计表。
 
 ## 裁判排班与场地协同（整场协同）
 

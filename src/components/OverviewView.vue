@@ -38,6 +38,19 @@ function appealBrief(a) {
       <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#22c15e,#7edda4)"></span><span class="ic">⛳</span><b>{{ prog }}%</b><em>整体完成度</em></div>
     </div>
 
+    <!-- 证件入场核验速览 -->
+    <div class="card mt" v-if="ov.access">
+      <div class="caption">🪪 赛事证件与入场核验 <span class="hint">有效证件 {{ ov.access.badges_active }} · 今日放行 {{ ov.access.today_pass }} · 拦截 {{ ov.access.today_deny }} · 强制放行 {{ ov.access.today_forced }} · 重复核验 {{ ov.access.today_duplicate }}</span></div>
+      <div class="pad">
+        <div class="grid g4" style="gap:12px">
+          <div class="mini-stat"><span>🟢 双方到场准备</span><b class="mono">{{ (ov.access.scheduled_matches - ov.access.matches_not_ready) }}/{{ ov.access.scheduled_matches }} 场</b><div class="hbar"><i :style="{ width: (ov.access.scheduled_matches ? Math.round((ov.access.scheduled_matches - ov.access.matches_not_ready) / ov.access.scheduled_matches * 100) : 100) + '%', background: 'var(--accent2)' }"></i></div></div>
+          <div class="mini-stat"><span>🧑‍⚖️ 执法到岗</span><b class="mono">{{ ov.access.crew_ready }}/{{ ov.access.crew_total }} 席</b><div class="hbar"><i :style="{ width: (ov.access.crew_total ? Math.round(ov.access.crew_ready / ov.access.crew_total * 100) : 100) + '%', background: 'var(--accent3)' }"></i></div></div>
+          <div class="mini-stat"><span>🪪 停用/暂扣证件</span><b class="mono" :style="{ color: ov.access.badges_blocked ? '#e5484d' : 'var(--accent2)' }">{{ ov.access.badges_blocked }}</b><div class="hbar"><i :style="{ width: ov.access.badges_blocked ? '100%' : '0%', background: '#e5484d' }"></i></div></div>
+          <div class="mini-stat"><span>⚠️ 今日异常（拦截+强制）</span><b class="mono" :style="{ color: ov.access.today_deny + ov.access.today_forced ? '#c98a00' : 'var(--accent2)' }">{{ ov.access.today_deny + ov.access.today_forced }}</b><div class="hbar"><i :style="{ width: (ov.access.today_deny + ov.access.today_forced) ? '100%' : '0%', background: 'var(--gold)' }"></i></div></div>
+        </div>
+      </div>
+    </div>
+
     <!-- 申诉复核速览 -->
     <div class="card mt" v-if="ov.appeals">
       <div class="caption">⚖️ 赛事申诉复核 <span class="hint">待受理 {{ ov.appeals.pending }} · 复核中 {{ ov.appeals.reviewing }} · 已改判 {{ ov.appeals.upheld }} / 共 {{ ov.appeals.total }} 件</span></div>
@@ -113,4 +126,7 @@ function appealBrief(a) {
 
 <style scoped>
 .note-line { font-size: 12px; color: var(--muted); margin-top: 6px; padding: 5px 9px; background: var(--bg2); border-radius: 8px; }
+.mini-stat { background: var(--bg2); border-radius: 12px; padding: 11px 14px; display: flex; flex-direction: column; gap: 6px; }
+.mini-stat span { font-size: 12px; color: var(--muted); font-weight: 600; }
+.mini-stat b { font-size: 17px; }
 </style>

@@ -87,6 +87,9 @@ async function saveTrack(sid) {
   setTimeout(() => toast.value = '', 3000)
 }
 const rankCls = r => r === 1 ? '#d99a00' : r === 2 ? '#90a4ae' : r === 3 ? '#c9743a' : 'var(--muted)'
+
+// 场次入场核验回写：双方到场 + 执法到岗 + 异常拦截
+const accessOf = id => store.matchAccess.find(x => x.match_id === id)
 </script>
 
 <template>
@@ -127,6 +130,13 @@ const rankCls = r => r === 1 ? '#d99a00' : r === 2 ? '#90a4ae' : r === 3 ? '#c97
             </span>
           </template>
           <span v-if="m.status==='scheduled' && !store.chiefOf(m.id)" class="tag o">🟠 尚未安排主裁</span>
+        </div>
+        <!-- 入场核验回写：双方到场 / 执法到岗 / 异常拦截 -->
+        <div v-if="m.status==='scheduled' && accessOf(m.id)" class="gate-line">
+          <span class="tag" :class="accessOf(m.id).team_a.checked_in ? 'g' : 'o'">{{ accessOf(m.id).team_a.checked_in ? '🟢' : '⏳' }} 主队列</span>
+          <span class="tag" :class="accessOf(m.id).team_b.checked_in ? 'g' : 'o'">{{ accessOf(m.id).team_b.checked_in ? '🟢' : '⏳' }} 客队列</span>
+          <span class="tag" :class="accessOf(m.id).crew_checked >= accessOf(m.id).crew_total && accessOf(m.id).crew_total ? 'g' : 'o'">🧑‍⚖️ 裁判到岗 {{ accessOf(m.id).crew_checked }}/{{ accessOf(m.id).crew_total }}</span>
+          <span v-if="accessOf(m.id).denied" class="tag r">⛔ 入场异常 {{ accessOf(m.id).denied }}</span>
         </div>
         <div v-if="active?.id === m.id && needTB" class="tbrow">
           <span>⚔️ 常规时间平分 · 加时/点球决胜：</span>
@@ -175,4 +185,5 @@ const rankCls = r => r === 1 ? '#d99a00' : r === 2 ? '#90a4ae' : r === 3 ? '#c97
 .tbrow { display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 8px; padding: 7px 10px; border-radius: 10px; background: #fff7ed; border: 1px dashed var(--accent); font-size: 12px; color: var(--muted); }
 .note-line { font-size: 12px; color: var(--muted); margin-top: 8px; padding: 5px 9px; background: var(--bg2); border-radius: 8px; }
 .crew-line { margin-top: 8px; }
+.gate-line { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
 </style>

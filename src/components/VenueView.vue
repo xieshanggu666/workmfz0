@@ -265,6 +265,7 @@ const roleMismatchCount = computed(() => store.conflicts?.role_mismatch?.length 
                   <span v-for="a in store.crewOf(m.id).filter(x => x.role === role)" :key="a.id" class="crew-chip">
                     <span class="tag gray">{{ ROLE_NAME[a.role] }}</span>
                     <b>{{ a.referee?.name }}</b>
+                    <span v-if="a.checkin_at" class="tag g" title="入场核验已到岗">🟢 已到岗</span>
                     <span v-if="a.referee?.sport && a.referee.sport !== s.name && a.referee.sport !== s.category" class="tag y" title="跨专长执法">跨项</span>
                     <span v-if="a.referee?.level && (LEVEL_RANK[a.referee.level] ?? 3) < ROLE_RANK[a.role]" class="tag y" title="等级低于角色要求">跨级</span>
                     <button class="mini" title="临时调班" @click="openReassign(a)">🔄 调班</button>

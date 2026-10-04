@@ -7,6 +7,7 @@ import ScoreView from '@/components/ScoreView.vue'
 import BracketView from '@/components/BracketView.vue'
 import RegistrationView from '@/components/RegistrationView.vue'
 import AppealView from '@/components/AppealView.vue'
+import AccessView from '@/components/AccessView.vue'
 import TeamView from '@/components/TeamView.vue'
 import VenueView from '@/components/VenueView.vue'
 import MedalView from '@/components/MedalView.vue'
@@ -18,13 +19,15 @@ store.init()
 const navs = [
   ['overview', '🏟️', '赛事总览'], ['schedule', '🗓️', '赛程编排'], ['score', '⚡', '成绩录入'],
   ['bracket', '🧩', '对阵积分'], ['registration', '📝', '报名审核'], ['appeal', '⚖️', '申诉复核'],
-  ['team', '👥', '队伍运动员'],
+  ['access', '🪪', '证件核验'], ['team', '👥', '队伍运动员'],
   ['venue', '📍', '场地裁判'], ['medal', '🥇', '奖牌榜'], ['reports', '📊', '报表中心']
 ]
 const view = ref('overview')
-const cur = { overview: OverviewView, schedule: ScheduleView, score: ScoreView, bracket: BracketView, registration: RegistrationView, appeal: AppealView, team: TeamView, venue: VenueView, medal: MedalView, reports: ReportsView }
+const cur = { overview: OverviewView, schedule: ScheduleView, score: ScoreView, bracket: BracketView, registration: RegistrationView, appeal: AppealView, access: AccessView, team: TeamView, venue: VenueView, medal: MedalView, reports: ReportsView }
 // 待受理 + 复核中 = 组委会待办
 const appealTodo = computed(() => (store.overview?.appeals?.pending || 0) + (store.overview?.appeals?.reviewing || 0))
+// 入场核验异常 = 今日拦截 + 强制放行（审计待办）
+const accessTodo = computed(() => (store.overview?.access?.today_deny || 0) + (store.overview?.access?.today_forced || 0))
 </script>
 
 <template>
@@ -38,6 +41,7 @@ const appealTodo = computed(() => (store.overview?.appeals?.pending || 0) + (sto
         <button v-for="(n, i) in navs" :key="n[0]" :class="{ active: view === n[0] }" @click="view = n[0]">
           <span class="em">{{ n[1] }}</span>{{ n[2] }}
           <span v-if="n[0] === 'appeal' && appealTodo" class="nav-badge">{{ appealTodo }}</span>
+          <span v-else-if="n[0] === 'access' && accessTodo" class="nav-badge" style="background:#e5484d">{{ accessTodo }}</span>
         </button>
       </nav>
       <div class="side-foot">

@@ -170,6 +170,75 @@ CREATE TABLE IF NOT EXISTS appeal_logs (
   created_at TEXT DEFAULT (datetime('now','localtime'))
 );
 CREATE INDEX IF NOT EXISTS idx_appeal_logs ON appeal_logs(appeal_id);
+
+-- 场地工作人员（证件发放对象之一：按岗位与服务场地获得动态权限）
+CREATE TABLE IF NOT EXISTS venue_staff (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT '志愿者',   -- 场地主管/医疗/安保/器材/媒体/志愿者
+  venue_id INTEGER NOT NULL,
+  phone TEXT,
+  status TEXT DEFAULT '在岗'             -- 在岗/离岗
+);
+-- 赛事证件：运动员/队伍/裁判/场地工作人员人手一证；权限区按资格与赛程动态计算并留快照
+CREATE TABLE IF NOT EXISTS badges (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL UNIQUE,        -- T-0001 队伍 / A-0001 运动员 / R-0001 裁判 / S-0001 工作人员
+  subject_type TEXT NOT NULL,       -- team / athlete / referee / staff
+  subject_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  unit_id INTEGER,
+  sport_id INTEGER,
+  venue_id INTEGER,
+  zones TEXT,                       -- 当前授权区域快照 JSON：competition/warmup/staff/media
+  status TEXT NOT NULL DEFAULT 'active',   -- active(有效) / blocked(停用/暂扣)
+  block_reason TEXT,
+  block_manual INTEGER DEFAULT 0,   -- 1=组委会人工暂扣（资格恢复不会自动解停，需人工解除）
+  issued_at TEXT DEFAULT (datetime('now','localtime')),
+  last_checkin_at TEXT,
+  checkin_count INTEGER DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_badge_subject ON badges(subject_type, subject_id);
+-- 入场核验流水：每次扫码一条（放行/拒绝/强制放行/重复核验），回写各业务域的唯一数据源
+CREATE TABLE IF NOT EXISTS access_checkins (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  badge_id INTEGER,
+  badge_code TEXT,
+  subject_type TEXT,                -- team/athlete/referee/staff（无法识别证件时为空）
+  subject_id INTEGER,
+  subject_name TEXT,
+  venue_id INTEGER,
+  match_id INTEGER,
+  sport_id INTEGER,
+  gate TEXT,                        -- 核验口（运动员通道/裁判通道/工作人员通道…）
+  result TEXT NOT NULL,             -- pass(放行) / deny(拒绝) / forced_pass(强制放行)
+  is_duplicate INTEGER DEFAULT 0,   -- 同日同场重复扫码：放行但不重复回写计数
+  role_snapshot TEXT,               -- 核验时角色（队伍/田径运动员/主裁/安保…）
+  zones TEXT,                       -- 本次授权/申请区域 JSON
+  reason TEXT,                      -- 拒绝/强制原因（人类可读）
+  reason_code TEXT,                 -- BADGE_NOT_FOUND/BADGE_BLOCKED/INELIGIBLE/NO_FIXTURE/WRONG_VENUE/NOT_ASSIGNED/MATCH_NOT_PLAYABLE
+  operator TEXT,
+  checkin_date TEXT,                -- date('now','localtime')，用于同日幂等
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_checkins_match ON access_checkins(match_id);
+CREATE INDEX IF NOT EXISTS idx_checkins_date ON access_checkins(checkin_date);
+CREATE INDEX IF NOT EXISTS idx_checkins_created ON access_checkins(created_at);
+-- 证件与入场异常审计：发放/同步/暂扣/解除/拒绝入场/强制放行 全量留痕
+CREATE TABLE IF NOT EXISTS access_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  action TEXT NOT NULL,             -- issue/sync/block/unblock/deny/force_pass
+  badge_id INTEGER,
+  badge_code TEXT,
+  match_id INTEGER,
+  venue_id INTEGER,
+  detail TEXT,
+  reason TEXT,
+  severity TEXT DEFAULT 'info',     -- info / warn / danger
+  operator TEXT,
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_access_logs_created ON access_logs(created_at);
 `)
 
 // —— 旧库迁移：补充字段（列已存在则忽略） ——
@@ -189,6 +258,24 @@ try { db.prepare(`ALTER TABLE matches ADD COLUMN note TEXT`).run() } catch (e) {
 })
 // 回填历史已完赛场次的胜方；小组/循环平局 winner 保持 NULL
 db.prepare(`UPDATE matches SET winner = CASE WHEN score_a > score_b THEN team_a WHEN score_b > score_a THEN team_b ELSE NULL END WHERE status='finished' AND winner IS NULL`).run()
+
+// —— 赛事证件与入场核验：回写字段（列已存在则忽略） ——
+// 报名域：最近一次入场核验时间与结果（已核验/拒绝/强制放行）
+;[['last_checkin_at', 'TEXT'], ['last_checkin_result', 'TEXT']].forEach(([col, def]) => {
+  try { db.prepare(`ALTER TABLE registrations ADD COLUMN ${col} ${def}`).run() } catch (e) { /* 列已存在 */ }
+})
+// 排班域：裁判该场签到核验时间
+;[['checkin_at', 'TEXT']].forEach(([col, def]) => {
+  try { db.prepare(`ALTER TABLE assignments ADD COLUMN ${col} ${def}`).run() } catch (e) { /* 列已存在 */ }
+})
+// 比赛域：双方到场、执法到岗与异常拦截计数
+;[
+  ['checkin_a_at', 'TEXT'], ['checkin_b_at', 'TEXT'],
+  ['checkin_crew', 'INTEGER DEFAULT 0'], ['checkin_crew_total', 'INTEGER DEFAULT 0'],
+  ['admission_denied', 'INTEGER DEFAULT 0']
+].forEach(([col, def]) => {
+  try { db.prepare(`ALTER TABLE matches ADD COLUMN ${col} ${def}`).run() } catch (e) { /* 列已存在 */ }
+})
 
 export function run(sql, ...p) { return db.prepare(sql).run(...p) }
 export function all(sql, ...p) { return db.prepare(sql).all(...p) }

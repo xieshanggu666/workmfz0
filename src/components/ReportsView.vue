@@ -60,6 +60,31 @@ function appealImpact(a) {
   if (im.medal_changes?.length) p.push(`${im.medal_changes.length}单位奖牌变动`)
   return p.join('；')
 }
+// —— 证件入场核验审计 ——
+const accessStat = computed(() => {
+  const c = { pass: 0, forced_pass: 0, deny: 0, duplicate: 0 }
+  store.checkins.forEach(r => {
+    if (r.is_duplicate) c.duplicate++
+    c[r.result] = (c[r.result] || 0) + 1
+  })
+  return c
+})
+const accessByReason = computed(() => {
+  const m = {}
+  store.checkins.filter(c => c.result === 'deny' || c.result === 'forced_pass').forEach(c => {
+    const k = c.reason_code || 'UNKNOWN'
+    m[k] = m[k] || { code: k, deny: 0, forced: 0 }
+    if (c.result === 'deny') m[k].deny++
+    else if (c.result === 'forced_pass') m[k].forced++
+  })
+  return Object.values(m).sort((a, b) => (b.deny + b.forced) - (a.deny + a.forced))
+})
+const REASON_LABEL = {
+  BADGE_NOT_FOUND: '证件不存在/已注销', BADGE_BLOCKED: '证件停用或暂扣', INELIGIBLE: '资格失效',
+  NO_FIXTURE: '无本场赛程（非对阵/无待赛）', WRONG_VENUE: '核验场地不符', NOT_ASSIGNED: '无在派执法排班',
+  MATCH_NOT_PLAYABLE: '场次已完赛/取消', DUPLICATE: '重复核验', UNKNOWN: '其他'
+}
+const matchAdmissionRows = computed(() => store.matchAccess)
 </script>
 
 <template>
@@ -186,6 +211,50 @@ function appealImpact(a) {
           </tbody>
         </table>
         <div v-if="!store.appeals.length" class="empty">暂无申诉记录</div>
+      </div>
+    </div>
+
+    <!-- 证件入场核验审计 -->
+    <div class="card mt">
+      <div class="caption">🪪 赛事证件与入场核验审计 <span class="hint">动态权限按资格+赛程判定 · 放行回写报名/排班/比赛 · 拒绝与强制放行进入异常审计</span></div>
+      <div class="pad">
+        <div class="row" style="gap:10px;flex-wrap:wrap;margin-bottom:14px">
+          <span class="tag g">✅ 放行 {{ accessStat.pass || 0 }}</span>
+          <span class="tag y">⚠️ 强制放行 {{ accessStat.forced_pass || 0 }}</span>
+          <span class="tag r">⛔ 拒绝入场 {{ accessStat.deny || 0 }}</span>
+          <span class="tag gray">🔁 重复核验 {{ accessStat.duplicate || 0 }}</span>
+        </div>
+        <div class="grid g2">
+          <div>
+            <div class="ph" style="font-size:12px;margin-bottom:8px;font-weight:700">异常原因分布（拒绝 / 强制放行）</div>
+            <table>
+              <thead><tr><th>原因</th><th>拒绝</th><th>强制放行</th></tr></thead>
+              <tbody>
+                <tr v-for="r in accessByReason" :key="r.code">
+                  <td>{{ REASON_LABEL[r.code] || r.code }}</td>
+                  <td class="mono" style="color:#e5484d;font-weight:800">{{ r.deny }}</td>
+                  <td class="mono" style="color:#c98a00;font-weight:800">{{ r.forced }}</td>
+                </tr>
+                <tr v-if="!accessByReason.length"><td colspan="3" class="empty">暂无异常记录</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div>
+            <div class="ph" style="font-size:12px;margin-bottom:8px;font-weight:700">场次到场/到岗回写（待赛）</div>
+            <table>
+              <thead><tr><th>场次</th><th>双方到场</th><th>裁判到岗</th><th>异常</th></tr></thead>
+              <tbody>
+                <tr v-for="m in matchAdmissionRows.filter(x => x.status === 'scheduled').slice(0, 8)" :key="m.match_id">
+                  <td class="ph" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ m.title }}</td>
+                  <td><span class="tag" :class="m.team_a.checked_in && m.team_b.checked_in ? 'g' : 'o'">{{ (m.team_a.checked_in ? 1 : 0) + (m.team_b.checked_in ? 1 : 0) }}/2</span></td>
+                  <td><span class="tag" :class="m.crew_checked >= m.crew_total && m.crew_total ? 'g' : 'o'">{{ m.crew_checked }}/{{ m.crew_total }}</span></td>
+                  <td class="mono" :style="{ color: m.denied ? '#e5484d' : 'var(--muted)', fontWeight: m.denied ? 800 : 400 }">{{ m.denied }}</td>
+                </tr>
+                <tr v-if="!matchAdmissionRows.filter(x => x.status === 'scheduled').length"><td colspan="4" class="empty">暂无待赛场次</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
       </div>
     </div>
 

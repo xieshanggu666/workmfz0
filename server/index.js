@@ -148,8 +148,9 @@ function releaseAssignment(assignmentId, operator = '组委会', reason = '') {
   const m = get('SELECT * FROM matches WHERE id=?', a.match_id)
   if (m && m.status !== 'scheduled') throw new Error('仅待赛场次可解除执法安排')
   const ref = get('SELECT name FROM referees WHERE id=?', a.referee_id)
-  run(`UPDATE assignments SET status='released', released_at=datetime('now','localtime') WHERE id=?`, assignmentId)
+  run(`UPDATE assignments SET status='released', released_at=datetime('now','localtime'), checkin_at=NULL WHERE id=?`, assignmentId)
   addLog('release', a.match_id, a.referee_id, `${matchTitle(m)}：${ref?.name || '裁判'} 解除${ROLE_NAME[a.role] || '执法'}安排`, reason, operator)
+  refreshMatchCrewCheckin(a.match_id)
   return { ok: true }
 }
 
@@ -207,7 +208,8 @@ function reassignAssignment(assignmentId, { target_id, new_referee_id, reason, o
     }
     const r1 = run(`INSERT INTO assignments (match_id,referee_id,role,status) VALUES (?,?,?,'assigned')`, mb.id, a.referee_id, a.role)
     const r2 = run(`INSERT INTO assignments (match_id,referee_id,role,status) VALUES (?,?,?,'assigned')`, m.id, b.referee_id, b.role)
-    run(`UPDATE assignments SET status='released', released_at=datetime('now','localtime') WHERE id IN (?,?)`, a.id, b.id)
+    run(`UPDATE assignments SET status='released', released_at=datetime('now','localtime'), checkin_at=NULL WHERE id IN (?,?)`, a.id, b.id)
+    refreshMatchCrewCheckin(m.id); refreshMatchCrewCheckin(mb.id)
     const refA = get('SELECT name FROM referees WHERE id=?', a.referee_id)
     const refB = get('SELECT name FROM referees WHERE id=?', b.referee_id)
     const detail = `${matchTitle(m)}：${refA.name} ⇄ ${refB.name}（${matchTitle(mb)}）对调`
@@ -239,7 +241,8 @@ function reassignAssignment(assignmentId, { target_id, new_referee_id, reason, o
   const dup = get(`SELECT id FROM assignments WHERE match_id=? AND referee_id=? AND status='assigned'`, m.id, newId)
   if (dup) throw new Error('该裁判已在本场次执法名单中')
   const r = run(`INSERT INTO assignments (match_id,referee_id,role,status) VALUES (?,?,?,'assigned')`, m.id, newId, a.role)
-  run(`UPDATE assignments SET status='released', released_at=datetime('now','localtime') WHERE id=?`, a.id)
+  run(`UPDATE assignments SET status='released', released_at=datetime('now','localtime'), checkin_at=NULL WHERE id=?`, a.id)
+  refreshMatchCrewCheckin(m.id)
   const oldRef = get('SELECT name FROM referees WHERE id=?', a.referee_id)
   addLog('reassign', m.id, newId, `${matchTitle(m)}：${ROLE_NAME[a.role]}由 ${oldRef.name} 改为 ${newRef.name}`, reason, op)
   return { ok: true, swapped: false, new_a: Number(r.lastInsertRowid) }
@@ -460,7 +463,7 @@ function lockAssignmentsOnFinish(m, operator = '系统') {
 function releaseAssignmentsOfMatch(m, why, operator = '系统', action = 'void_release') {
   const as = all(`SELECT * FROM assignments WHERE match_id=? AND status='assigned'`, m.id)
   as.forEach(a => {
-    run(`UPDATE assignments SET status='released', released_at=datetime('now','localtime') WHERE id=?`, a.id)
+    run(`UPDATE assignments SET status='released', released_at=datetime('now','localtime'), checkin_at=NULL WHERE id=?`, a.id)
     const r = get('SELECT name FROM referees WHERE id=?', a.referee_id)
     addLog(action, m.id, a.referee_id, `${matchTitle(m)}：${r?.name || '裁判'} 的${ROLE_NAME[a.role]}安排随场次调整解除（${why}）`, why, operator)
   })
@@ -705,6 +708,393 @@ function seed() {
     acceptAppeal(r.id, '仲裁委员会')
     closeAppeal(r.id, 'reject', '经核查学籍证明与报名材料一致，资格有效，申诉驳回', '仲裁委员会')
   }
+
+  // —— 场地工作人员（证件发放对象；按岗位与服务场地获得动态授权区域）——
+  const staffRows = [
+    ['刘主管', '场地主管', '中心篮球馆', '13800000001'],
+    ['赵医生', '医疗', '五人足球场', '13800000002'],
+    ['钱安保', '安保', '田径场', '13800000003'],
+    ['孙器材', '器材', '羽毛球馆', '13800000004'],
+    ['周记者', '媒体', '羽毛球馆', '13800000005'],
+    ['吴志愿', '志愿者', '备用2号场', '13800000006']
+  ]
+  const staffId = {}
+  staffRows.forEach(([n, role, vname, phone]) => {
+    const r = run('INSERT INTO venue_staff (name,role,venue_id,phone,status) VALUES (?,?,?,?,?)', n, role, vid(vname), phone, '在岗')
+    staffId[n] = Number(r.lastInsertRowid)
+  })
+
+  // —— 发放全部赛事证件并按资格/赛程同步授权区域 ——
+  syncAllBadges('系统', false)
+  const badgeCode = (type, subjectId) => get('SELECT code FROM badges WHERE subject_type=? AND subject_id=?', type, subjectId)?.code
+
+  // —— 演示入场核验：以足球小组末轮 A 组（雷霆 VS 闪电）为主场景 ——
+  const gateMatch = get(`SELECT m.* FROM matches m WHERE m.sport_id=? AND m.group_name='A组' AND m.status='scheduled'`, spFoot)
+  if (gateMatch) {
+    const footVenue = gateMatch.venue_id
+    // 主队到场（按赛程放行：资格有效 + 对阵双方 + 场地一致）
+    verifyAccess({ code: badgeCode('team', gateMatch.team_a), venueId: footVenue, matchId: gateMatch.id, operator: '东门检票员' })
+    // 主裁到岗（末轮对调后该场主裁为张裁判）
+    const chief = get(`SELECT referee_id FROM assignments WHERE match_id=? AND role='chief' AND status='assigned'`, gateMatch.id)
+    if (chief) verifyAccess({ code: badgeCode('referee', chief.referee_id), venueId: footVenue, matchId: gateMatch.id, operator: '裁判通道' })
+    // 场地医疗到岗
+    verifyAccess({ code: badgeCode('staff', staffId['赵医生']), venueId: footVenue, matchId: gateMatch.id, operator: '工作人员通道' })
+    // 异常：非对阵队伍（雄狮队在 B 组）扫 A 组末轮 → 拒绝入场并计入该场异常
+    verifyAccess({ code: badgeCode('team', F[2]), venueId: footVenue, matchId: gateMatch.id, operator: '东门检票员' })
+    // 异常后强制放行：客队（闪电队）跟队大巴延误，先在错误的篮球馆口被拦（场地不符），值班主任在同一核验口批准强制放行并留痕
+    verifyAccess({ code: badgeCode('team', gateMatch.team_b), venueId: vid('中心篮球馆'), matchId: gateMatch.id, operator: '东门检票员' })
+    verifyAccess({ code: badgeCode('team', gateMatch.team_b), venueId: vid('中心篮球馆'), matchId: gateMatch.id, force: true, reason: '球员跟队大巴延误，值班主任核验参赛名单后批准先行入场，赛后补办场地手续', operator: '值主任' })
+  }
+  // 田径场：运动员核验入场（无对阵赛程，按项目资格 + 场地放行）
+  const runner = get(`SELECT id FROM athletes WHERE name='林一'`)
+  if (runner) verifyAccess({ code: badgeCode('athlete', runner.id), venueId: vid('田径场'), operator: '检录处' })
+  // 异常：媒体记者（仅媒体区）在运动员通道扫比赛区 → 场地不符拒绝
+  verifyAccess({ code: badgeCode('staff', staffId['周记者']), venueId: vid('五人足球场'), operator: '运动员通道' })
+}
+/* ================= 赛事证件与入场核验 ================= */
+// 证件类型 / 授权区域 / 场地工作人员岗位
+const SUBJECT_NAME = { team: '队伍', athlete: '田径运动员', referee: '裁判', staff: '场地工作人员' }
+const ZONE_NAME = { competition: '比赛区', warmup: '热身区', staff: '工作区', media: '媒体区' }
+const BADGE_PREFIX = { team: 'T', athlete: 'A', referee: 'R', staff: 'S' }
+// 场地工作人员岗位 → 授权区域（按岗位动态授予，不泛化放行）
+const STAFF_ZONES = {
+  '场地主管': ['competition', 'staff'],
+  '医疗': ['competition', 'staff'],
+  '安保': ['competition', 'staff'],
+  '器材': ['warmup', 'staff'],
+  '志愿者': ['staff'],
+  '媒体': ['media']
+}
+const GATE_BY_TYPE = { team: '运动员通道', athlete: '运动员通道', referee: '裁判通道', staff: '工作人员通道' }
+
+function addAccessLog(action, badgeId, code, detail, reason, operator, severity = 'info', matchId = null, venueId = null) {
+  run(`INSERT INTO access_logs (action,badge_id,badge_code,match_id,venue_id,detail,reason,severity,operator)
+       VALUES (?,?,?,?,?,?,?,?,?)`, action, badgeId ?? null, code ?? null, matchId ?? null, venueId ?? null,
+    detail ?? null, reason ?? null, severity, operator || '系统')
+}
+function nextBadgeCode(type) {
+  const n = get('SELECT COUNT(*) c FROM badges WHERE subject_type=?', type)?.c + 1
+  return `${BADGE_PREFIX[type]}-${String(n).padStart(4, '0')}`
+}
+function baseZonesOf(subjectType) {
+  if (subjectType === 'team' || subjectType === 'athlete') return ['competition', 'warmup']
+  if (subjectType === 'referee') return ['competition', 'staff']
+  return []
+}
+// 证件主体的实时资格（资格状态 + 服务/执法关系）
+function subjectState(type, id) {
+  if (type === 'team') {
+    const t = get('SELECT * FROM teams WHERE id=?', id)
+    return t ? { exists: true, status: t.status, unit_id: t.unit_id, sport_id: t.sport_id, name: t.name } : { exists: false }
+  }
+  if (type === 'athlete') {
+    const a = get('SELECT * FROM athletes WHERE id=?', id)
+    return a ? { exists: true, status: a.status, unit_id: a.unit_id, sport_id: a.sport_id, name: a.name } : { exists: false }
+  }
+  if (type === 'referee') {
+    const r = get('SELECT * FROM referees WHERE id=?', id)
+    return r ? { exists: true, status: ['就绪', '在岗'].includes(r.status) ? 'approved' : 'blocked', name: r.name, raw_status: r.status } : { exists: false }
+  }
+  const s = get('SELECT * FROM venue_staff WHERE id=?', id)
+  return s ? { exists: true, status: s.status === '在岗' ? 'approved' : 'blocked', name: s.name, venue_id: s.venue_id, role: s.role, raw_status: s.status } : { exists: false }
+}
+function zonesForBadge(type, state) {
+  if (type === 'staff') return STAFF_ZONES[state.role] || ['staff']
+  return baseZonesOf(type)
+}
+// 同步单张证件：按实时资格发放/停用，刷新授权区域快照；人工暂扣证件不自动恢复
+function syncBadge(type, id, operator = '系统', logIt = false) {
+  const state = subjectState(type, id)
+  let badge = get('SELECT * FROM badges WHERE subject_type=? AND subject_id=?', type, id)
+  if (!state.exists) {
+    if (badge && badge.status !== 'blocked') {
+      run(`UPDATE badges SET status='blocked', block_reason='主体已删除', zones='[]' WHERE id=?`, badge.id)
+      if (logIt) addAccessLog('sync', badge.id, badge.code, `证件 ${badge.code} 随主体注销停用`, '主体已删除', operator, 'warn')
+    }
+    return badge || null
+  }
+  const eligible = state.status === 'approved'
+  const zones = eligible ? zonesForBadge(type, state) : []
+  if (!badge) {
+    const code = nextBadgeCode(type)
+    const blockReason = eligible ? null : '资格尚未生效（待审核/未通过/已失效）'
+    const r = run(`INSERT INTO badges (code,subject_type,subject_id,name,unit_id,sport_id,venue_id,zones,status,block_reason)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      code, type, id, state.name, state.unit_id ?? null, state.sport_id ?? null, state.venue_id ?? null,
+      JSON.stringify(zones), eligible ? 'active' : 'blocked', blockReason)
+    badge = get('SELECT * FROM badges WHERE id=?', Number(r.lastInsertRowid))
+    if (logIt) addAccessLog('issue', badge.id, code, `发放证件 ${code}（${SUBJECT_NAME[type]}「${state.name}」，授权：${zones.map(z => ZONE_NAME[z]).join('、') || '暂无'}）`, null, operator, 'info')
+  } else {
+    const wasBlocked = badge.status === 'blocked'
+    const newStatus = badge.block_manual ? badge.status : (eligible ? 'active' : 'blocked')
+    const reason = eligible ? null : '资格未通过或已失效'
+    run(`UPDATE badges SET name=?, unit_id=?, sport_id=?, venue_id=?, zones=?, status=?, block_reason=? WHERE id=?`,
+      state.name, state.unit_id ?? null, state.sport_id ?? null, state.venue_id ?? null, JSON.stringify(zones), newStatus, badge.block_manual ? badge.block_reason : reason, badge.id)
+    if (logIt && wasBlocked && newStatus === 'active') {
+      addAccessLog('sync', badge.id, badge.code, `证件 ${badge.code} 资格恢复，自动恢复有效（授权：${zones.map(z => ZONE_NAME[z]).join('、')}）`, null, operator, 'info')
+    }
+    badge = get('SELECT * FROM badges WHERE id=?', badge.id)
+  }
+  return badge
+}
+// 全量同步证件（幂等）：为全部应持证对象建证/刷新，资格失效自动停用；健康库上无操作
+function syncAllBadges(operator = '系统', logIt = false) {
+  const groups = [
+    ['team', all('SELECT id FROM teams').map(r => r.id)],
+    ['athlete', all('SELECT id FROM athletes').map(r => r.id)],
+    ['referee', all('SELECT id FROM referees').map(r => r.id)],
+    ['staff', all('SELECT id FROM venue_staff').map(r => r.id)]
+  ]
+  const validKeys = new Set()
+  groups.forEach(([type, ids]) => ids.forEach(id => { syncBadge(type, id, operator, logIt); validKeys.add(`${type}:${id}`) }))
+  // 清理主体已不存在的残留证件
+  all('SELECT id, code, subject_type, subject_id FROM badges').forEach(b => {
+    if (!validKeys.has(`${b.subject_type}:${b.subject_id}`)) {
+      run(`UPDATE badges SET status='blocked', block_reason='主体已删除', zones='[]' WHERE id=?`, b.id)
+    }
+  })
+}
+// 人工暂扣 / 解除暂扣（解除时重新按资格同步）
+function setBadgeBlocked(badgeId, blocked, reason, operator) {
+  return withTransaction(() => {
+    const b = get('SELECT * FROM badges WHERE id=?', badgeId)
+    if (!b) throw new Error('证件不存在')
+    if (blocked) {
+      if (b.status === 'blocked' && b.block_manual) return { ok: true, idempotent: true }
+      run(`UPDATE badges SET status='blocked', block_manual=1, block_reason=? WHERE id=?`, reason || '组委会暂扣', badgeId)
+      addAccessLog('block', b.id, b.code, `证件 ${b.code} 被人工暂扣（${b.name}）`, reason, operator, 'danger')
+    } else {
+      if (b.status === 'active' && !b.block_manual) return { ok: true, idempotent: true }
+      run(`UPDATE badges SET block_manual=0, block_reason=NULL WHERE id=?`, badgeId)
+      syncBadge(b.subject_type, b.subject_id, operator, false)
+      const fresh = get('SELECT * FROM badges WHERE id=?', badgeId)
+      addAccessLog('unblock', b.id, b.code, `证件 ${b.code} 解除暂扣，按当前资格判定为${fresh.status === 'active' ? '有效' : '停用'}`, reason || null, operator, 'info')
+    }
+    return { ok: true }
+  })
+}
+// 该队伍当前赛程的待赛/进行中比赛（资格与赛程共同决定动态入场权限）
+function upcomingMatchOfTeam(teamId) {
+  return get(`SELECT * FROM matches WHERE (team_a=? OR team_b=?) AND status='scheduled'
+              ORDER BY time_label, id LIMIT 1`, teamId, teamId) || null
+}
+// 该裁判当前时段的在派待赛场次
+function assignedMatchOfReferee(refereeId, timeLabel) {
+  if (!timeLabel) return null
+  const rows = all(`SELECT m.*, a.role FROM assignments a JOIN matches m ON m.id=a.match_id
+                    WHERE a.referee_id=? AND a.status='assigned' AND m.status='scheduled' AND m.time_label=?`, refereeId, timeLabel)
+  return rows[0] || null
+}
+// 回写：把本次放行结果同步到报名 / 排班 / 比赛 三个业务域（核验流水是唯一写入方）
+function writeBackCheckin({ badge, type, subjectId, match, result, now, gate, timeLabel }) {
+  const resultText = result === 'forced_pass' ? '强制放行' : '已核验'
+  if (type === 'team' || type === 'athlete') {
+    const col = type === 'team' ? 'team_id' : 'athlete_id'
+    const reg = get(`SELECT id FROM registrations WHERE ${col}=? ORDER BY id DESC LIMIT 1`, subjectId)
+    if (reg) run(`UPDATE registrations SET last_checkin_at=?, last_checkin_result=? WHERE id=?`, now, resultText, reg.id)
+  }
+  if (type === 'referee' && timeLabel) {
+    const a = get(`SELECT a.id FROM assignments a JOIN matches m ON m.id=a.match_id
+                   WHERE a.referee_id=? AND a.status='assigned' AND m.status='scheduled' AND m.time_label=?
+                   ORDER BY m.id LIMIT 1`, subjectId, timeLabel)
+    if (a) run(`UPDATE assignments SET checkin_at=? WHERE id=?`, now, a.id)
+  }
+  if (match) {
+    if (type === 'team') {
+      const col = match.team_a === subjectId ? 'checkin_a_at' : match.team_b === subjectId ? 'checkin_b_at' : null
+      if (col) run(`UPDATE matches SET ${col}=? WHERE id=?`, now, match.id)
+    }
+    if (type === 'referee') {
+      run(`UPDATE matches SET checkin_crew = (SELECT COUNT(*) FROM assignments WHERE match_id=? AND status='assigned' AND checkin_at IS NOT NULL),
+                           checkin_crew_total = (SELECT COUNT(*) FROM assignments WHERE match_id=? AND status='assigned')
+               WHERE id=?`, match.id, match.id, match.id)
+    }
+  }
+  run(`UPDATE badges SET last_checkin_at=?, checkin_count=checkin_count+1 WHERE id=?`, now, badge.id)
+}
+// 核心：入场核验。按 资格 + 赛程 实时判定动态权限；放行结果原子回写三域，拒绝写入异常审计。
+// 幂等：同证件 + 同场次 + 同日已有放行记录时，直接返回首次核验结果，不重复回写。
+function verifyAccess({ code, venueId, matchId, gate, force, operator, timeLabel, reason }) {
+  code = String(code || '').trim().toUpperCase()
+  if (!code) throw new Error('请输入证件编号')
+  const op = operator || '检票员'
+  const now = get("SELECT datetime('now','localtime') t")?.t
+  const today = get("SELECT date('now','localtime') d")?.d
+  venueId = venueId ? Number(venueId) : null
+  matchId = matchId ? Number(matchId) : null
+  const badge = get('SELECT * FROM badges WHERE code=?', code)
+
+  // 无法识别证件：仅登记异常流水，不存在回写目标
+  if (!badge) {
+    const r = run(`INSERT INTO access_checkins (badge_code,venue_id,match_id,gate,result,is_duplicate,reason,reason_code,operator,checkin_date)
+                   VALUES (?,?,?,?,'deny',0,?,?,?,?)`,
+      code, venueId, matchId, gate || null, '证件不存在或已注销', 'BADGE_NOT_FOUND', op, today)
+    addAccessLog('deny', null, code, `${gate || '核验口'} 拒绝入场：证件 ${code} 无法识别`, '证件不存在或已注销', op, 'danger', matchId, venueId)
+    return { ok: true, pass: false, result: 'deny', reason: '证件不存在或已注销', reason_code: 'BADGE_NOT_FOUND', checkin_id: Number(r.lastInsertRowid) }
+  }
+  const type = badge.subject_type, subjectId = badge.subject_id
+  const state = subjectState(type, subjectId)
+  let match = matchId ? get('SELECT * FROM matches WHERE id=?', matchId) : null
+  if (matchId && !match) throw new Error('核验场次不存在')
+  if (match) timeLabel = match.time_label
+  const zones = safeParseJson(badge.zones) || []
+  let decision = null   // { code, message, eligibleMatch, roleText }
+
+  if (badge.status === 'blocked' || !state.exists || state.status !== 'approved') {
+    const why = !state.exists ? '证件主体已不存在'
+      : badge.block_manual ? (badge.block_reason || '证件被组委会暂扣')
+      : state.status === 'pending' ? '资格尚在审核中'
+      : state.status === 'rejected' ? '资格审核未通过'
+      : state.status === 'withdrawn' ? '已退报，资格终止'
+      : state.status === 'revoked' ? '资格已被撤销'
+      : (state.raw_status === '离岗' ? '场地工作人员已离岗' : '当前不在岗')
+    decision = { code: 'BADGE_BLOCKED', message: why }
+  } else if (type === 'team') {
+    // 队伍：资格有效 + 该场确为其赛程（对阵双方）+ 场地一致 + 场次可入场
+    if (!match) {
+      const up = upcomingMatchOfTeam(subjectId)
+      if (up) match = up
+    }
+    if (!match) {
+      decision = { code: 'NO_FIXTURE', message: '当前没有该队伍的待赛场次（按赛程入场）' }
+    } else if (match.status !== 'scheduled') {
+      decision = { code: 'MATCH_NOT_PLAYABLE', message: `该场次当前为${match.status === 'finished' ? '已完赛' : '已取消'}状态，不能入场`, eligibleMatch: match }
+    } else if (match.team_a !== subjectId && match.team_b !== subjectId) {
+      decision = { code: 'NO_FIXTURE', message: '该队伍不是本场对阵双方，无本场入场资格', eligibleMatch: match }
+    } else if (venueId && match.venue_id && venueId !== match.venue_id) {
+      decision = { code: 'WRONG_VENUE', message: `本场比赛在「${get('SELECT name FROM venues WHERE id=?', match.venue_id)?.name}」进行，当前核验场地不符`, eligibleMatch: match }
+    }
+  } else if (type === 'athlete') {
+    // 田径单项运动员：项目资格有效 + 核验场地为该项目场地（无对阵赛程）
+    const spo = state.sport_id ? get('SELECT * FROM sports WHERE id=?', state.sport_id) : null
+    const expectedVenue = spo ? vid(spo.venue) : null
+    if (match && match.sport_id !== state.sport_id) {
+      decision = { code: 'NO_FIXTURE', message: '该运动员报名项目与本场比赛无关' }
+    } else if (venueId && expectedVenue && venueId !== expectedVenue) {
+      decision = { code: 'WRONG_VENUE', message: `该运动员项目在「${spo.venue}」进行，当前核验场地不符` }
+    }
+  } else if (type === 'referee') {
+    // 裁判：按排班核验——当前时段须在该场（或同时段某场）执法名单中
+    let assigned = null
+    if (match) {
+      assigned = get(`SELECT * FROM assignments WHERE match_id=? AND referee_id=? AND status='assigned'`, match.id, subjectId)
+      if (!assigned && timeLabel) assigned = get(`SELECT a.*, m.id match_id FROM assignments a JOIN matches m ON m.id=a.match_id
+                                                   WHERE a.referee_id=? AND a.status='assigned' AND m.status='scheduled' AND m.time_label=?
+                                                   ORDER BY m.id LIMIT 1`, subjectId, timeLabel)
+    } else if (timeLabel) {
+      const m0 = assignedMatchOfReferee(subjectId, timeLabel)
+      if (m0) { assigned = { role: m0.role }; match = m0 }
+    }
+    if (!assigned) {
+      decision = { code: 'NOT_ASSIGNED', message: timeLabel ? `该裁判在 ${timeLabel} 时段没有在派执法任务（按排班入场）` : '该裁判当前没有在派执法任务，请选择核验场次或时段' }
+    } else if (venueId && match.venue_id && venueId !== match.venue_id) {
+      decision = { code: 'WRONG_VENUE', message: `该裁判执法场次在「${get('SELECT name FROM venues WHERE id=?', match.venue_id)?.name}」，当前核验场地不符` }
+    } else if (match.status !== 'scheduled') {
+      decision = { code: 'MATCH_NOT_PLAYABLE', message: '执法场次不是待赛状态' }
+    } else {
+      decision = { roleText: ROLE_NAME[assigned.role] || '执法' }
+    }
+  } else if (type === 'staff') {
+    // 场地工作人员：按服务场地与岗位授权入场，不依赖赛程
+    if (venueId && state.venue_id && venueId !== state.venue_id) {
+      decision = { code: 'WRONG_VENUE', message: `该工作人员服务场地为「${get('SELECT name FROM venues WHERE id=?', state.venue_id)?.name}」` }
+    }
+  }
+
+  // 同日同场幂等：已放行过则返回首次结果（重复扫码不重复计数/回写）
+  const dup = match?.id
+    ? get(`SELECT * FROM access_checkins WHERE badge_id=? AND match_id=? AND checkin_date=?
+           AND result IN ('pass','forced_pass') AND is_duplicate=0 ORDER BY id DESC LIMIT 1`, badge.id, match.id, today)
+    : get(`SELECT * FROM access_checkins WHERE badge_id=? AND match_id IS NULL AND checkin_date=?
+           AND result IN ('pass','forced_pass') AND is_duplicate=0 ORDER BY id DESC LIMIT 1`, badge.id, today)
+
+  const makeRecord = (result, isDuplicate, reasonText, reasonCode, roleText, zonesNow) => run(
+    `INSERT INTO access_checkins (badge_id,badge_code,subject_type,subject_id,subject_name,venue_id,match_id,sport_id,gate,result,is_duplicate,role_snapshot,zones,reason,reason_code,operator,checkin_date)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    badge.id, badge.code, type, subjectId, badge.name, venueId, match?.id ?? null,
+    match?.sport_id ?? state.sport_id ?? badge.sport_id ?? null,
+    gate || GATE_BY_TYPE[type] || '核验口', result, isDuplicate ? 1 : 0, roleText || null,
+    JSON.stringify(zonesNow || zones), reasonText || null, reasonCode || null, op, today)
+
+  // 拒绝（或强制放行）处理
+  if (decision && decision.code) {
+    if (dup) {
+      makeRecord(dup.result, true, `重复核验（首次已于 ${dup.created_at} 放行）`, 'DUPLICATE', dup.role_snapshot, zones)
+      return {
+        ok: true, pass: true, result: dup.result, duplicate: true,
+        message: `重复核验，该证已于 ${dup.created_at} 在本口放行`,
+        badge: { code: badge.code, name: badge.name, subject_type: type }, match: match ? matchTitle(match) : null
+      }
+    }
+    if (force) {
+      if (!String(reason || '').trim()) throw new Error('强制放行必须填写原因并留痕')
+      const rr = makeRecord('forced_pass', false, `强制放行：${decision.message}；原因：${reason}`, decision.code, decision.roleText, zones)
+      writeBackCheckin({ badge, type, subjectId, match, result: 'forced_pass', now, gate, timeLabel })
+      if (match) run(`UPDATE matches SET admission_denied=admission_denied+1 WHERE id=?`, match.id)
+      addAccessLog('force_pass', badge.id, badge.code,
+        `${gate || GATE_BY_TYPE[type]} 强制放行 ${badge.name}（${SUBJECT_NAME[type]}）入场${match ? '：' + matchTitle(match) : ''}；拦截原因：${decision.message}`,
+        String(reason).trim(), op, 'warn', match?.id ?? null, venueId)
+      return {
+        ok: true, pass: true, result: 'forced_pass', checkin_id: Number(rr.lastInsertRowid),
+        message: `已强制放行：${decision.message}（已留痕并计入异常审计）`,
+        badge: { code: badge.code, name: badge.name, subject_type: type, zones }, match: match ? matchTitle(match) : null
+      }
+    }
+    const rr = makeRecord('deny', false, decision.message, decision.code, decision.roleText, zones)
+    if (match) run(`UPDATE matches SET admission_denied=admission_denied+1 WHERE id=?`, match.id)
+    addAccessLog('deny', badge.id, badge.code,
+      `${gate || GATE_BY_TYPE[type]} 拒绝 ${badge.name}（${SUBJECT_NAME[type]}）入场${match ? '：' + matchTitle(match) : ''}：${decision.message}`,
+      decision.message, op, 'danger', match?.id ?? null, venueId)
+    return {
+      ok: true, pass: false, result: 'deny', reason: decision.message, reason_code: decision.code,
+      checkin_id: Number(rr.lastInsertRowid),
+      badge: { code: badge.code, name: badge.name, subject_type: type }, match: match ? matchTitle(match) : null
+    }
+  }
+
+  // 正常放行（含重复核验）
+  const roleText = decision?.roleText || (type === 'staff' ? state.role : SUBJECT_NAME[type])
+  if (dup) {
+    makeRecord('pass', true, `重复核验（首次已于 ${dup.created_at} 放行）`, 'DUPLICATE', roleText, zones)
+    return {
+      ok: true, pass: true, result: 'pass', duplicate: true,
+      message: `✅ 重复核验，该证已于 ${dup.created_at} 在本口放行`,
+      badge: { code: badge.code, name: badge.name, subject_type: type, zones }, match: match ? matchTitle(match) : null
+    }
+  }
+  const rr = makeRecord('pass', false, null, null, roleText, zones)
+  writeBackCheckin({ badge, type, subjectId, match, result: 'pass', now, gate, timeLabel })
+  addAccessLog('pass', badge.id, badge.code,
+    `${gate || GATE_BY_TYPE[type]} 放行 ${badge.name}（${roleText}）进入${zones.map(z => ZONE_NAME[z]).join('、')}${match ? '：' + matchTitle(match) : ''}`,
+    null, op, 'info', match?.id ?? null, venueId)
+  return {
+    ok: true, pass: true, result: 'pass', checkin_id: Number(rr.lastInsertRowid),
+    role: roleText, zones, zones_text: zones.map(z => ZONE_NAME[z]).join('、'),
+    badge: { code: badge.code, name: badge.name, subject_type: type },
+    match: match ? matchTitle(match) : null,
+    message: `✅ 核验通过：${badge.name}（${roleText}）可进入 ${zones.map(z => ZONE_NAME[z]).join('、')}`
+  }
+}
+
+// 场次入场核验汇总：双方到场 + 执法到岗 + 异常拦截
+function matchAdmissionRows(matches) {
+  return matches.filter(m => m.team_a != null && m.team_b != null && m.status !== 'void').map(m => {
+    const crewRows = all(`SELECT a.*, r.name rname FROM assignments a JOIN referees r ON r.id=a.referee_id
+                          WHERE a.match_id=? AND a.status='assigned' ORDER BY a.role, a.id`, m.id)
+    return {
+      match_id: m.id,
+      title: matchTitle(m),
+      status: m.status,
+      time_label: m.time_label,
+      venue: m.venue_id ? get('SELECT name FROM venues WHERE id=?', m.venue_id)?.name : null,
+      team_a: { id: m.team_a, name: get('SELECT name FROM teams WHERE id=?', m.team_a)?.name, checked_in: !!m.checkin_a_at, at: m.checkin_a_at },
+      team_b: { id: m.team_b, name: m.team_b ? get('SELECT name FROM teams WHERE id=?', m.team_b)?.name : null, checked_in: !!m.checkin_b_at, at: m.checkin_b_at },
+      crew: crewRows.map(a => ({ id: a.id, name: a.rname, role: a.role, role_name: ROLE_NAME[a.role], checked_in: !!a.checkin_at, at: a.checkin_at })),
+      crew_checked: crewRows.filter(a => a.checkin_at).length,
+      crew_total: crewRows.length,
+      denied: m.admission_denied || 0
+    }
+  })
 }
 /* ================= 积分与奖牌 ================= */
 function rebuildStandings(sportId) {
@@ -866,14 +1256,24 @@ function finishWalkover(m, winnerId, note, operator = '系统') {
 
 // 已赛场次取消成绩；仍在派/计入历史的执法安排同步解除
 function voidMatch(m, note, operator = '系统') {
-  run(`UPDATE matches SET status='void', score_a=NULL, score_b=NULL, tb_a=NULL, tb_b=NULL, winner=NULL, note=? WHERE id=?`, note, m.id)
+  run(`UPDATE matches SET status='void', score_a=NULL, score_b=NULL, tb_a=NULL, tb_b=NULL, winner=NULL, note=?,
+      checkin_a_at=NULL, checkin_b_at=NULL, checkin_crew=0, checkin_crew_total=0, admission_denied=0 WHERE id=?`, note, m.id)
   releaseAssignmentsOfMatch({ ...m, status: 'void' }, note, operator)
+}
+
+// 重算场次执法到岗计数（调班/解除后保持与在派名单一致）
+function refreshMatchCrewCheckin(matchId) {
+  if (matchId == null) return
+  run(`UPDATE matches SET checkin_crew = (SELECT COUNT(*) FROM assignments WHERE match_id=? AND status='assigned' AND checkin_at IS NOT NULL),
+                       checkin_crew_total = (SELECT COUNT(*) FROM assignments WHERE match_id=? AND status='assigned')
+               WHERE id=?`, matchId, matchId, matchId)
 }
 
 // 已生成的后续轮次需要改赛或重赛：释放原执法安排，回到待赛并替换对阵队伍
 function resetScheduledMatch(m, teamA, teamB, note, operator = '系统') {
   releaseAssignmentsOfMatch(m, note, operator, 'match_change')
-  run(`UPDATE matches SET status='scheduled', team_a=?, team_b=?, score_a=NULL, score_b=NULL, tb_a=NULL, tb_b=NULL, winner=NULL, note=? WHERE id=?`,
+  run(`UPDATE matches SET status='scheduled', team_a=?, team_b=?, score_a=NULL, score_b=NULL, tb_a=NULL, tb_b=NULL, winner=NULL, note=?,
+      checkin_a_at=NULL, checkin_b_at=NULL, checkin_crew=0, checkin_crew_total=0, admission_denied=0 WHERE id=?`,
     teamA, teamB, note, m.id)
   const fresh = get('SELECT * FROM matches WHERE id=?', m.id)
   addLog('match_change', m.id, null, `${matchTitle(m)} 因资格变动调整对阵，原执法安排已解除`, note, operator)
@@ -1183,12 +1583,14 @@ function submitRegistration(kind, unitId, sportId, name) {
       const r = run('INSERT INTO teams (name,unit_id,sport_id,status) VALUES (?,?,?,?)', name, unitId, sportId, 'pending')
       const teamId = Number(r.lastInsertRowid)
       run('INSERT INTO registrations (kind,unit_id,sport_id,team_id,name,status) VALUES (?,?,?,?,?,?)', kind, unitId, sportId, teamId, name, 'pending')
+      syncBadge('team', teamId, '系统', false)
       return { id: teamId, kind }
     }
     if (get('SELECT id FROM athletes WHERE name=? AND sport_id=? AND unit_id=?', name, sportId, unitId)) throw new Error('该单位已报名同名运动员')
     const r = run('INSERT INTO athletes (name,unit_id,sport_id,status) VALUES (?,?,?,?)', name, unitId, sportId, 'pending')
     const athId = Number(r.lastInsertRowid)
     run('INSERT INTO registrations (kind,unit_id,sport_id,athlete_id,name,status) VALUES (?,?,?,?,?,?)', kind, unitId, sportId, athId, name, 'pending')
+    syncBadge('athlete', athId, '系统', false)
     return { id: athId, kind }
   })
 }
@@ -1263,6 +1665,8 @@ function approveRegistration(regId, reviewer) {
     }
     rebuildStandings(reg.sport_id)
     recomputeMedals()
+    // 资格生效 → 发放/激活赛事证件并按赛程同步动态授权区域
+    syncBadge(reg.kind, reg.kind === 'team' ? reg.team_id : reg.athlete_id, reviewer || '系统', true)
     return { ok: true, quota_no: quotaNo }
   })
 }
@@ -1279,6 +1683,8 @@ function rejectRegistration(regId, note, reviewer) {
     if (!claim.changes) return { ok: true, idempotent: true }   // 并发下已被其它请求处理
     if (reg.kind === 'team') run(`UPDATE teams SET status='rejected' WHERE id=? AND status='pending'`, reg.team_id)
     else run(`UPDATE athletes SET status='rejected' WHERE id=? AND status='pending'`, reg.athlete_id)
+    // 证件联动：资格驳回 → 证件保持停用（待资格通过后再激活）
+    syncBadge(reg.kind, reg.kind === 'team' ? reg.team_id : reg.athlete_id, reviewer || '系统', false)
     return { ok: true }
   })
 }
@@ -1383,6 +1789,8 @@ function withdrawOrRevoke(regId, action, note, reviewer) {
       recomputeTrackRanks(reg.sport_id)
     }
     recomputeMedals()
+    // 证件联动：退报/撤销资格 → 赛事证件立即停用，原授权区域收回（入场核验将拒绝）
+    syncBadge(reg.kind, reg.kind === 'team' ? reg.team_id : reg.athlete_id, reviewer || '系统', true)
     return { ok: true, impact }
   })
 }
@@ -1446,7 +1854,8 @@ const scoreText = (sa, sb, ta, tb) => `${sa}:${sb}` + (ta != null ? `（决胜 $
 function resetMatchForReplay(m, teamA, teamB, note, operator) {
   const wasVoid = m.status === 'void'
   run(`UPDATE matches SET status='scheduled', team_a=?, team_b=?, score_a=NULL, score_b=NULL,
-      tb_a=NULL, tb_b=NULL, winner=NULL, note=? WHERE id=?`, teamA, teamB, note, m.id)
+      tb_a=NULL, tb_b=NULL, winner=NULL, note=?,
+      checkin_a_at=NULL, checkin_b_at=NULL, checkin_crew=0, checkin_crew_total=0, admission_denied=0 WHERE id=?`, teamA, teamB, note, m.id)
   const fresh = get('SELECT * FROM matches WHERE id=?', m.id)
   if (wasVoid) addLog('match_change', m.id, null, `${matchTitle(fresh)} 因申诉改判恢复待赛并替换对阵，重新联动排班`, note, operator)
   else addLog('match_change', m.id, null, `${matchTitle(fresh)} 因申诉改判回退待赛重赛，原执法名单保留`, note, operator)
@@ -1793,6 +2202,8 @@ seed()
   const fixed = r.duplicate_matches + r.quota_no_fixed + r.entries_cleaned
   if (fixed || r.over_quota.length) console.log('[SPORT] 历史赛程统计修复：', JSON.stringify(r))
 }
+// 启动即全量同步赛事证件（为旧库补发、按资格刷新授权区域；幂等，健康库为无操作）
+syncAllBadges('系统', false)
 
 /* ================= API ================= */
 const joinMatch = m => {
@@ -1814,6 +2225,7 @@ app.post('/api/referees', (req, res) => {
   if (!name) return res.status(400).json({ error: '裁判姓名不能为空' })
   if (get('SELECT id FROM referees WHERE name=?', name)) return res.status(400).json({ error: '已存在同名裁判' })
   const r = run('INSERT INTO referees (name,sport,level,status) VALUES (?,?,?,?)', name, req.body.sport || null, req.body.level || '主裁', req.body.status || '就绪')
+  syncBadge('referee', Number(r.lastInsertRowid), '组委会', true)
   res.json({ ok: true, id: Number(r.lastInsertRowid) })
 })
 app.get('/api/athletes', (_, res) => res.json(all('SELECT a.*, u.name unit FROM athletes a JOIN units u ON u.id=a.unit_id')))
@@ -2053,6 +2465,93 @@ app.post('/api/appeals/:id/uphold', (req, res) => {
     res.json(r)
   } catch (e) { res.status(400).json({ error: e.message }) }
 })
+/* —— 赛事证件与入场核验 —— */
+const joinBadge = b => {
+  let subject = null, unit = null
+  if (b.subject_type === 'team') subject = get('SELECT id,name,status,unit_id,sport_id FROM teams WHERE id=?', b.subject_id)
+  else if (b.subject_type === 'athlete') subject = get('SELECT id,name,status,unit_id,sport_id FROM athletes WHERE id=?', b.subject_id)
+  else if (b.subject_type === 'referee') subject = get('SELECT id,name,status,sport,level FROM referees WHERE id=?', b.subject_id)
+  else subject = get(`SELECT vs.id,vs.name,vs.status,vs.role,vs.venue_id, v.name venue_name
+                      FROM venue_staff vs LEFT JOIN venues v ON v.id=vs.venue_id WHERE vs.id=?`, b.subject_id)
+  if (b.unit_id) unit = get('SELECT id,name,color FROM units WHERE id=?', b.unit_id)
+  const sport = b.sport_id ? get('SELECT id,name,format,category FROM sports WHERE id=?', b.sport_id) : null
+  const venue = b.venue_id ? get('SELECT id,name FROM venues WHERE id=?', b.venue_id) : null
+  return { ...b, zones: safeParseJson(b.zones) || [], subject, unit, sport, venue }
+}
+app.get('/api/badges', (_, res) => {
+  res.json(all(`SELECT * FROM badges ORDER BY
+    CASE status WHEN 'blocked' THEN 0 ELSE 1 END, subject_type, id`).map(joinBadge))
+})
+app.post('/api/badges/sync', (req, res) => {
+  try {
+    withTransaction(() => syncAllBadges(req.body?.operator || '组委会', true))
+    res.json({ ok: true })
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
+app.post('/api/badges/:id/block', (req, res) => {
+  try { res.json(setBadgeBlocked(Number(req.params.id), true, req.body.reason, req.body.operator || '组委会')) }
+  catch (e) { res.status(400).json({ error: e.message }) }
+})
+app.post('/api/badges/:id/unblock', (req, res) => {
+  try { res.json(setBadgeBlocked(Number(req.params.id), false, req.body.reason, req.body.operator || '组委会')) }
+  catch (e) { res.status(400).json({ error: e.message }) }
+})
+// 场地工作人员
+app.get('/api/staff', (_, res) => {
+  res.json(all(`SELECT vs.*, v.name venue_name FROM venue_staff vs LEFT JOIN venues v ON v.id=vs.venue_id ORDER BY vs.id`))
+})
+app.post('/api/staff', (req, res) => {
+  try {
+    const name = (req.body.name || '').trim()
+    if (!name) return res.status(400).json({ error: '工作人员姓名不能为空' })
+    const role = (req.body.role || '志愿者').trim()
+    if (!STAFF_ZONES[role]) return res.status(400).json({ error: '岗位无效' })
+    const venueId = Number(req.body.venue_id)
+    if (!get('SELECT id FROM venues WHERE id=?', venueId)) return res.status(400).json({ error: '请选择服务场地' })
+    if (get('SELECT id FROM venue_staff WHERE name=? AND venue_id=?', name, venueId)) return res.status(400).json({ error: '该场地已存在同名工作人员' })
+    const r = run('INSERT INTO venue_staff (name,role,venue_id,phone,status) VALUES (?,?,?,?,?)',
+      name, role, venueId, (req.body.phone || '').trim() || null, req.body.status || '在岗')
+    const id = Number(r.lastInsertRowid)
+    withTransaction(() => syncBadge('staff', id, req.body.operator || '组委会', true))
+    res.json({ ok: true, id })
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
+// 入场核验（扫码）：资格 + 赛程 动态判定，结果回写报名/排班/比赛，拒绝写入异常审计
+app.post('/api/access/verify', (req, res) => {
+  try {
+    const r = withTransaction(() => verifyAccess({
+      code: req.body.code, venueId: req.body.venue_id ? Number(req.body.venue_id) : null,
+      matchId: req.body.match_id ? Number(req.body.match_id) : null,
+      gate: req.body.gate, force: !!req.body.force, reason: req.body.reason,
+      operator: req.body.operator, timeLabel: req.body.time_label || null
+    }))
+    res.json(r)
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
+app.get('/api/access/checkins', (req, res) => {
+  const limit = Math.min(300, Number(req.query.limit) || 100)
+  const result = req.query.result
+  const rows = all(`SELECT c.*, v.name venue_name
+                    FROM access_checkins c LEFT JOIN venues v ON v.id=c.venue_id
+                    ${result ? 'WHERE c.result=?' : ''}
+                    ORDER BY c.id DESC LIMIT ?`, ...(result ? [result] : []), limit)
+  res.json(rows.map(c => ({ ...c, zones: safeParseJson(c.zones) || [] })))
+})
+app.get('/api/access/logs', (req, res) => {
+  const limit = Math.min(300, Number(req.query.limit) || 100)
+  const severity = req.query.severity
+  res.json(all(`SELECT l.*, v.name venue_name FROM access_logs l
+                LEFT JOIN venues v ON v.id=l.venue_id
+                ${severity ? 'WHERE l.severity=?' : ''}
+                ORDER BY l.id DESC LIMIT ?`, ...(severity ? [severity] : []), limit))
+})
+// 场次入场汇总：双方到场 / 执法到岗 / 异常拦截
+app.get('/api/access/matches', (req, res) => {
+  const ms = all('SELECT * FROM matches ORDER BY time_label, id')
+  let rows = matchAdmissionRows(ms)
+  if (String(req.query.status || '') === 'scheduled') rows = rows.filter(r => r.status === 'scheduled')
+  res.json(rows)
+})
 app.get('/api/quota', (_, res) => {
   const sports = all('SELECT * FROM sports')
   res.json(sports.map(s => {
@@ -2096,6 +2595,34 @@ app.get('/api/overview', (_, res) => {
       reviewing: get(`SELECT COUNT(*) c FROM appeals WHERE status='reviewing'`)?.c || 0,
       upheld: get(`SELECT COUNT(*) c FROM appeals WHERE status='upheld'`)?.c || 0
     },
+    // 证件与入场核验速览：发证规模、当日核验、异常拦截、双方到场/执法到岗准备度
+    access: (() => {
+      const today = get("SELECT date('now','localtime') d")?.d
+      const todayRows = all(`SELECT result, is_duplicate FROM access_checkins WHERE checkin_date=?`, today)
+      const countToday = (result, dupOnly = null) => todayRows.filter(r => r.result === result && (dupOnly == null || !!r.is_duplicate === dupOnly)).length
+      const badgesActive = get(`SELECT COUNT(*) c FROM badges WHERE status='active'`)?.c || 0
+      const badgesBlocked = get(`SELECT COUNT(*) c FROM badges WHERE status='blocked'`)?.c || 0
+      const scheduledBall = mats.filter(m => m.status === 'scheduled' && m.team_a && m.team_b && crewSpecOfMatch(m).chief > 0)
+      const teamsMissing = scheduledBall.reduce((n, m) => n + (m.checkin_a_at ? 0 : 1) + (m.checkin_b_at ? 0 : 1), 0)
+      const crewRows = all(`SELECT a.checkin_at, a.match_id FROM assignments a JOIN matches m ON m.id=a.match_id
+                            WHERE a.status='assigned' AND m.status='scheduled' AND m.team_a IS NOT NULL AND m.team_b IS NOT NULL`)
+      const crewTotal = crewRows.length
+      const crewReady = crewRows.filter(a => a.checkin_at).length
+      return {
+        badges_active: badgesActive,
+        badges_blocked: badgesBlocked,
+        today_pass: countToday('pass', false),
+        today_duplicate: countToday('pass', true) + countToday('forced_pass', true),
+        today_deny: countToday('deny'),
+        today_forced: countToday('forced_pass', false),
+        total_checkins: get('SELECT COUNT(*) c FROM access_checkins')?.c || 0,
+        matches_not_ready: scheduledBall.filter(m => !m.checkin_a_at || !m.checkin_b_at).length,
+        scheduled_matches: scheduledBall.length,
+        teams_missing: teamsMissing,
+        crew_ready: crewReady,
+        crew_total: crewTotal
+      }
+    })(),
     sportDone: sp.map(s => ({ ...s, total: mats.filter(m => m.sport_id === s.id).length, done: done.filter(m => m.sport_id === s.id).length })),
     recent: all('SELECT * FROM matches ORDER BY id DESC LIMIT 5').map(joinMatch)
   })
@@ -2138,7 +2665,7 @@ app.post('/api/track/:sportId', (req, res) => {
 app.get('/api/reset', (_, res) => {
   // 单事务重置 + 重置后立即执行历史统计修复，保证演示数据口径一致
   withTransaction(() => {
-    ['appeal_logs', 'appeals', 'assignment_logs', 'assignments', 'registrations', 'entries', 'standings', 'medals', 'matches', 'referees', 'venues', 'athletes', 'teams', 'units', 'sports'].forEach(t => { try { run(`DELETE FROM ${t}`) } catch (e) {} })
+    ['access_checkins', 'access_logs', 'badges', 'venue_staff', 'appeal_logs', 'appeals', 'assignment_logs', 'assignments', 'registrations', 'entries', 'standings', 'medals', 'matches', 'referees', 'venues', 'athletes', 'teams', 'units', 'sports'].forEach(t => { try { run(`DELETE FROM ${t}`) } catch (e) {} })
     seed()
     repairHistoricalStats('系统')
   })

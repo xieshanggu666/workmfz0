@@ -172,6 +172,10 @@ const unitColor = uid => store.unitOfUid(uid)?.color || '#ccc'
               <span class="t" style="font-size:15px"><b>{{ r.name }}</b><span v-if="r.quota_no" class="tag y" style="margin-left:8px">名额 #{{ r.quota_no }}</span></span>
               <span class="hint" style="font-size:11px">提交于 {{ r.submitted_at }}</span>
             </div>
+            <div v-if="r.last_checkin_at" class="row" style="gap:6px;margin-top:4px">
+              <span class="tag" :class="r.last_checkin_result === '强制放行' ? 'y' : 'b'">🎫 {{ r.last_checkin_result || '已核验' }} · {{ r.last_checkin_at }}</span>
+              <span class="hint" style="font-size:11px">入场核验回写</span>
+            </div>
             <div v-if="r.review_note" class="note-line">📝 {{ r.review_note }}<span v-if="r.reviewer"> · {{ r.reviewer }}</span><span v-if="r.reviewed_at"> · {{ r.reviewed_at }}</span></div>
 
             <!-- 操作区 -->
