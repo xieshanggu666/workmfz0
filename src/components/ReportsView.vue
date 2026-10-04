@@ -60,6 +60,19 @@ function appealImpact(a) {
   if (im.medal_changes?.length) p.push(`${im.medal_changes.length}单位奖牌变动`)
   return p.join('；')
 }
+// —— 赛事证件与入场核验审计 ——
+const accessStats = computed(() => {
+  const c = { PASS_IN: 0, PASS_OUT: 0, DENY: 0 }
+  const reasons = {}
+  store.accessLogs.forEach(l => { c[l.result] = (c[l.result] || 0) + 1; if (l.result === 'DENY') reasons[l.reason] = (reasons[l.reason] || 0) + 1 })
+  return { c, reasons }
+})
+const REASON_TEXT_R = {
+  SUSPENDED: '证件停用', REVOKED: '证件注销', EXPIRED: '已过期', NOT_YET: '未生效',
+  ZONE_DENIED: '区域未授权', VENUE_DENIED: '场地不符', OUTSIDE_WINDOW: '非入场时间窗',
+  NO_SCHEDULE: '无赛程/排班', UNKNOWN: '查无此证'
+}
+const recentDenies = computed(() => store.accessLogs.filter(l => l.result === 'DENY').slice(0, 8))
 </script>
 
 <template>
@@ -186,6 +199,33 @@ function appealImpact(a) {
           </tbody>
         </table>
         <div v-if="!store.appeals.length" class="empty">暂无申诉记录</div>
+      </div>
+    </div>
+
+    <!-- 证件核验与异常审计 -->
+    <div class="card mt">
+      <div class="caption">🪪 证件入场核验与异常审计 <span class="hint">资格+赛程+排班+岗位实时鉴权 · 放行回写 · 拦截闭环</span></div>
+      <div class="pad">
+        <div class="row" style="gap:10px;flex-wrap:wrap;margin-bottom:14px">
+          <span class="tag g">入场放行 {{ accessStats.c.PASS_IN || 0 }}</span>
+          <span class="tag b">离场 {{ accessStats.c.PASS_OUT || 0 }}</span>
+          <span class="tag r">拦截 {{ accessStats.c.DENY || 0 }}</span>
+          <span v-for="(n, key) in accessStats.reasons" :key="key" class="tag y">{{ REASON_TEXT_R[key] || key }} ×{{ n }}</span>
+        </div>
+        <table>
+          <thead><tr><th>时间</th><th>证件号</th><th>持证人</th><th>核验点</th><th>拦截原因</th><th>回写/处置</th></tr></thead>
+          <tbody>
+            <tr v-for="l in recentDenies" :key="l.id">
+              <td class="mono" style="white-space:nowrap">{{ l.created_at }}</td>
+              <td class="mono" style="font-weight:700">{{ l.code }}</td>
+              <td>{{ l.holder_name || '身份未知' }}</td>
+              <td>{{ l.venue_name }}{{ l.zone ? ' · ' + l.zone : '' }}</td>
+              <td><span class="tag r">{{ REASON_TEXT_R[l.reason] || l.reason }}</span><div class="hint" style="max-width:280px">{{ l.detail }}</div></td>
+              <td><span v-if="l.handled" class="tag g">已处置：{{ l.handle_note }}</span><span v-else class="tag o">待处置</span></td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-if="!recentDenies.length" class="empty">暂无拦截记录</div>
       </div>
     </div>
 

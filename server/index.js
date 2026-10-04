@@ -705,6 +705,57 @@ function seed() {
     acceptAppeal(r.id, '仲裁委员会')
     closeAppeal(r.id, 'reject', '经核查学籍证明与报名材料一致，资格有效，申诉驳回', '仲裁委员会')
   }
+
+  // ================= 赛事证件与入场核验（演示数据） =================
+  // 场地工作人员：安保/医护/器材/播报，分属不同场地 → 按岗位场地获得动态权限
+  const staffRows = [
+    ['韩保安', '安保主管', '中心篮球馆'], ['秦医生', '随队医护', '田径场'],
+    ['尤器材', '器材管理', '五人足球场'], ['何播报', '记录播报', '羽毛球馆']
+  ]
+  staffRows.forEach(([n, role, vn]) => run('INSERT INTO staff (name,role,venue_id,status) VALUES (?,?,?,?)', n, role, vid(vn), '在岗'))
+
+  // 已通过报名（球队/运动员）、裁判、工作人员批量签发赛事证件（幂等）
+  syncCredentials('all', '系统')
+
+  const credCodeOf = (type, holderId) => get(`SELECT * FROM credentials WHERE holder_type=? AND holder_id=? AND status<>'revoked' ORDER BY id LIMIT 1`, type, holderId)
+  // 选一场待赛足球（带主裁在派）做"到场+签到"演示
+  const footM = get(`SELECT m.* FROM matches m
+                     JOIN assignments a ON a.match_id=m.id AND a.role='chief' AND a.status='assigned'
+                     WHERE m.sport_id=? AND m.status='scheduled' ORDER BY m.time_label,m.id LIMIT 1`, spFoot)
+  if (footM) {
+    const chief = get(`SELECT referee_id FROM assignments WHERE match_id=? AND role='chief' AND status='assigned'`, footM.id)
+    // 球队到场（开赛前 40 分钟，时间窗内）→ 回写比赛到场 + 报名签到
+    performAccessCheck({ code: credCodeOf('team', footM.team_a)?.code, venue_id: footM.venue_id, zone: '运动员区', now: shiftHM(footM.time_label, -40), gate: '五人足球场东闸' })
+    // 主裁签到（开赛前 30 分钟）→ 回写排班签到
+    if (chief) performAccessCheck({ code: credCodeOf('referee', chief.referee_id)?.code, venue_id: footM.venue_id, zone: '裁判区', now: shiftHM(footM.time_label, -30), gate: '裁判通道' })
+    // 客队走错场地：在篮球馆刷足球比赛证件 → 场地不符拦截（异常审计）
+    performAccessCheck({ code: credCodeOf('team', footM.team_b)?.code, venue_id: vid('中心篮球馆'), zone: '运动员区', now: shiftHM(footM.time_label, -20), gate: '篮球馆北闸' })
+  }
+  // 未检录开放时段的田径运动员：上午 08:00 到田径场检录区核验 → 回写检录
+  const firstRunner = get(`SELECT id FROM athletes WHERE sport_id=? ORDER BY id LIMIT 1`, sp100)
+  if (firstRunner) performAccessCheck({ code: credCodeOf('athlete', firstRunner.id)?.code, venue_id: vid('田径场'), zone: '检录区', now: '08:00', gate: '田径场检录口' })
+  // 工作人员到岗 → 回写 staff.last_check_at
+  const security = get(`SELECT id FROM staff WHERE name='韩保安'`)
+  if (security) performAccessCheck({ code: credCodeOf('staff', security.id)?.code, venue_id: vid('中心篮球馆'), zone: '工作区', now: '07:40', gate: '员工通道' })
+  // 未知号码 → 伪证拦截
+  performAccessCheck({ code: 'XX-9999', venue_id: vid('中心篮球馆'), now: '08:10', gate: '篮球馆北闸' })
+  // 停用一张球队证件再刷卡 → 证件停用拦截（挂起的异常）
+  const flyTeam = get(`SELECT id FROM teams WHERE sport_id=? AND name='飞鹰队' ORDER BY id LIMIT 1`, spBasket)
+  if (flyTeam) {
+    const fc = credCodeOf('team', flyTeam.id)
+    run(`UPDATE credentials SET status='suspended', suspended_at=datetime('now','localtime'), suspend_reason=? WHERE id=?`, '证件芯片损坏，待制证中心更换', fc.id)
+    performAccessCheck({ code: fc.code, venue_id: vid('中心篮球馆'), zone: '运动员区', now: '08:30', gate: '篮球馆北闸' })
+  }
+  // 已完赛篮球的球队在非比赛时间窗刷卡 → 无待赛场次（NO_SCHEDULE 由场地范围为空时给出；此处该队无待赛场）
+  const champTeam = get(`SELECT id FROM teams WHERE sport_id=? AND name='雷霆队' ORDER BY id LIMIT 1`, spBasket)
+  if (champTeam) performAccessCheck({ code: credCodeOf('team', champTeam.id)?.code, venue_id: vid('中心篮球馆'), zone: '运动员区', now: '12:00', gate: '篮球馆北闸' })
+}
+// 演示用：把 HH:MM 平移 delta 分钟，生成闸机核验时刻（seed 内调用）
+function shiftHM(label, delta) {
+  const m = /^(\d{1,2}):(\d{2})/.exec(String(label || ''))
+  if (!m) return label
+  let total = Number(m[1]) * 60 + Number(m[2]) + delta
+  return `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`
 }
 /* ================= 积分与奖牌 ================= */
 function rebuildStandings(sportId) {
@@ -873,7 +924,8 @@ function voidMatch(m, note, operator = '系统') {
 // 已生成的后续轮次需要改赛或重赛：释放原执法安排，回到待赛并替换对阵队伍
 function resetScheduledMatch(m, teamA, teamB, note, operator = '系统') {
   releaseAssignmentsOfMatch(m, note, operator, 'match_change')
-  run(`UPDATE matches SET status='scheduled', team_a=?, team_b=?, score_a=NULL, score_b=NULL, tb_a=NULL, tb_b=NULL, winner=NULL, note=? WHERE id=?`,
+  run(`UPDATE matches SET status='scheduled', team_a=?, team_b=?, score_a=NULL, score_b=NULL, tb_a=NULL, tb_b=NULL, winner=NULL,
+      team_a_checked_in=0, team_b_checked_in=0, team_a_check_at=NULL, team_b_check_at=NULL, note=? WHERE id=?`,
     teamA, teamB, note, m.id)
   const fresh = get('SELECT * FROM matches WHERE id=?', m.id)
   addLog('match_change', m.id, null, `${matchTitle(m)} 因资格变动调整对阵，原执法安排已解除`, note, operator)
@@ -1156,9 +1208,12 @@ function finishTrack(sportId, body) {
   }
 
   // 事务写入：任一更新失败整体回滚，绝不允许半结算污染排名与奖牌
+  let notChecked = []
   withTransaction(() => {
     // 清理失去资格（退报/撤销）运动员残留的成绩档案
     entries.filter(e => e.status !== 'approved').forEach(e => run('DELETE FROM entries WHERE id=?', e.entry_id))
+    notChecked = rows.filter(r => !get('SELECT checked_in c FROM entries WHERE athlete_id=? AND sport_id=?', r.athleteId, sportId)?.c)
+      .map(r => get('SELECT name FROM athletes WHERE id=?', r.athleteId)?.name).filter(Boolean)
     rows.sort((a, b) => a.mark - b.mark)
     rows.forEach((r, i) => {
       const unitId = get('SELECT unit_id FROM athletes WHERE id=?', r.athleteId)?.unit_id ?? null
@@ -1169,6 +1224,7 @@ function finishTrack(sportId, body) {
   })
 
   recomputeMedals()
+  return { warning: notChecked.length ? `${notChecked.length} 名运动员未核验检录（${notChecked.join('、')}），成绩已结算请核查` : null }
 }
 /* ================= 参赛资格审核（报名 → 审核 → 退报/撤销） ================= */
 function submitRegistration(kind, unitId, sportId, name) {
@@ -1263,7 +1319,9 @@ function approveRegistration(regId, reviewer) {
     }
     rebuildStandings(reg.sport_id)
     recomputeMedals()
-    return { ok: true, quota_no: quotaNo }
+    // 资格通过 → 立即签发赛事证件（球队/运动员按赛程动态生效）；报名记录回写证件关联
+    const cred = issueCredential({ holder_type: reg.kind, holder_id: reg.kind === 'team' ? reg.team_id : reg.athlete_id, registration_id: reg.id, operator: reviewer || '系统' })
+    return { ok: true, quota_no: quotaNo, credential_code: cred.code }
   })
 }
 
@@ -1382,6 +1440,9 @@ function withdrawOrRevoke(regId, action, note, reviewer) {
       impact.entries = r.changes
       recomputeTrackRanks(reg.sport_id)
     }
+    // 退报/撤销资格 → 赛事证件注销，闸机即刻拦截；签到回写随之失效
+    impact.credentials = revokeCredentialByHolder(reg.kind, reg.kind === 'team' ? reg.team_id : reg.athlete_id,
+      `${action === 'withdraw' ? '退报' : '撤销资格'}：${reason}`, reviewer || '系统')
     recomputeMedals()
     return { ok: true, impact }
   })
@@ -1446,7 +1507,8 @@ const scoreText = (sa, sb, ta, tb) => `${sa}:${sb}` + (ta != null ? `（决胜 $
 function resetMatchForReplay(m, teamA, teamB, note, operator) {
   const wasVoid = m.status === 'void'
   run(`UPDATE matches SET status='scheduled', team_a=?, team_b=?, score_a=NULL, score_b=NULL,
-      tb_a=NULL, tb_b=NULL, winner=NULL, note=? WHERE id=?`, teamA, teamB, note, m.id)
+      tb_a=NULL, tb_b=NULL, winner=NULL,
+      team_a_checked_in=0, team_b_checked_in=0, team_a_check_at=NULL, team_b_check_at=NULL, note=? WHERE id=?`, teamA, teamB, note, m.id)
   const fresh = get('SELECT * FROM matches WHERE id=?', m.id)
   if (wasVoid) addLog('match_change', m.id, null, `${matchTitle(fresh)} 因申诉改判恢复待赛并替换对阵，重新联动排班`, note, operator)
   else addLog('match_change', m.id, null, `${matchTitle(fresh)} 因申诉改判回退待赛重赛，原执法名单保留`, note, operator)
@@ -1786,12 +1848,317 @@ function repairHistoricalStats(operator = '系统') {
     return report
   })
 }
+/* ================= 赛事证件与入场核验 ================= */
+// 证件不是静态白名单：每次核验都按「资格状态 + 赛程时间窗 + 场地 + 执法排班 + 岗位 + 授权区域」实时计算权限。
+// 核验结论全量留痕；放行时把到场/检录/签到结果回写比赛、报名、排班与岗位，拦截进异常审计。
+const HOLDER_META = {
+  team: { prefix: 'TM', label: '参赛队', zones: ['运动员区', '热身区'] },
+  athlete: { prefix: 'AT', label: '运动员', zones: ['运动员区', '检录区', '热身区'] },
+  referee: { prefix: 'RF', label: '裁判员', zones: ['裁判区', '比赛区', '记录台'] },
+  staff: { prefix: 'ST', label: '工作人员', zones: ['工作区', '后勤区'] }
+}
+const PRE_LEAD = 90    // 开赛前 90 分钟起可入场
+const POST_TAIL = 60   // 开赛后 60 分钟内仍可入场
+function hmToMin(label) {
+  const m = /^(\d{1,2}):(\d{2})/.exec(String(label || ''))
+  return m ? Number(m[1]) * 60 + Number(m[2]) : null
+}
+function nowToMin(now) {
+  if (now === undefined || now === null || now === '') return new Date().getHours() * 60 + new Date().getMinutes()
+  const v = hmToMin(now)
+  if (v == null) throw new Error('核验时间格式应为 HH:MM')
+  return v
+}
+function nowDateTimeStr() {
+  const d = new Date(), p = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+function todayDateStr() { return nowDateTimeStr().slice(0, 10) }
+function nextCredentialCode(type) {
+  const prefix = HOLDER_META[type].prefix
+  let max = 0
+  all(`SELECT code FROM credentials WHERE code LIKE ?`, prefix + '-%').forEach(r => {
+    const n = parseInt(String(r.code).slice(prefix.length + 1), 10)
+    if (Number.isFinite(n) && n > max) max = n
+  })
+  return `${prefix}-${String(max + 1).padStart(4, '0')}`
+}
+// 签发证件（幂等：同一持证人存在未注销证件时直接返回）
+function issueCredential({ holder_type, holder_id, registration_id = null, zones = null, operator = '系统' }) {
+  if (!HOLDER_META[holder_type]) throw new Error('证件类型无效')
+  const exist = get(`SELECT * FROM credentials WHERE holder_type=? AND holder_id=? AND status<>'revoked' ORDER BY id`, holder_type, holder_id)
+  if (exist) return { id: exist.id, code: exist.code, idempotent: true }
+  const code = nextCredentialCode(holder_type)
+  const r = run(`INSERT INTO credentials (code,holder_type,holder_id,registration_id,zones,issued_by)
+                 VALUES (?,?,?,?,?,?)`, code, holder_type, holder_id, registration_id, zones ? JSON.stringify(zones) : null, operator)
+  const id = Number(r.lastInsertRowid)
+  if (registration_id) run(`UPDATE registrations SET credential_id=? WHERE id=?`, id, registration_id)
+  return { id, code }
+}
+// 资格退报/撤销 → 证件同步注销（此后闸机一律拦截）
+function revokeCredentialByHolder(holderType, holderId, reason, operator = '系统') {
+  return run(`UPDATE credentials SET status='revoked', revoked_at=datetime('now','localtime'), suspend_reason=?
+              WHERE holder_type=? AND holder_id=? AND status<>'revoked'`,
+    reason || '资格失效，证件注销', holderType, holderId).changes
+}
+function effectiveZones(cred) {
+  const meta = HOLDER_META[cred.holder_type]
+  const parsed = safeParseJson(cred.zones)
+  return Array.isArray(parsed) && parsed.length ? parsed : meta.zones
+}
+// 持证人当前的动态权限范围（赛程/岗位驱动）：
+// 球队 → 本人待赛场次；裁判 → 本人在派待赛场次（含角色）；田径运动员 → 本项目场地（全天检录）；工作人员 → 所属场地（当班全天）
+function buildScopes(cred) {
+  if (cred.holder_type === 'team') {
+    const t = get('SELECT * FROM teams WHERE id=?', cred.holder_id)
+    if (!t || t.status !== 'approved') return []
+    return all(`SELECT * FROM matches WHERE (team_a=? OR team_b=?) AND status='scheduled' AND venue_id IS NOT NULL ORDER BY time_label,id`, cred.holder_id, cred.holder_id)
+      .map(m => ({ key: `match:${m.id}`, kind: 'match', match_id: m.id, venue_id: m.venue_id, time_label: m.time_label, title: matchTitle(m) }))
+  }
+  if (cred.holder_type === 'referee') {
+    return all(`SELECT a.role, m.* FROM assignments a JOIN matches m ON m.id=a.match_id
+                WHERE a.referee_id=? AND a.status='assigned' AND m.status='scheduled' AND m.venue_id IS NOT NULL
+                ORDER BY m.time_label,m.id`, cred.holder_id)
+      .map(m => ({ key: `match:${m.id}`, kind: 'duty', match_id: m.id, venue_id: m.venue_id, time_label: m.time_label, role: m.role, title: matchTitle(m) }))
+  }
+  if (cred.holder_type === 'athlete') {
+    const a = get('SELECT * FROM athletes WHERE id=?', cred.holder_id)
+    if (!a || a.status !== 'approved') return []
+    const spo = get('SELECT * FROM sports WHERE id=?', a.sport_id)
+    const venueId = vid(spo?.venue)
+    return [{ key: `track:${spo.id}`, kind: 'track', sport_id: spo.id, venue_id: venueId, time_label: null, title: `${spo.name} 检录参赛` }]
+  }
+  const st = get('SELECT * FROM staff WHERE id=?', cred.holder_id)
+  if (!st || st.status !== '在岗' || !st.venue_id) return []
+  const vn = get('SELECT name FROM venues WHERE id=?', st.venue_id)?.name || ''
+  return [{ key: `staff:${st.id}`, kind: 'staff', venue_id: st.venue_id, time_label: null, title: `${vn} · ${st.role || '场地保障'}` }]
+}
+const REASON_TEXT = {
+  OK: '人证一致，权限有效', ALREADY_IN: '重复入场（已在场内）', SUSPENDED: '证件已停用', REVOKED: '证件已注销',
+  EXPIRED: '证件已过有效期', NOT_YET: '证件尚未生效', ZONE_DENIED: '区域未授权', VENUE_DENIED: '场地不符',
+  OUTSIDE_WINDOW: '非当场入场时间窗', NO_SCHEDULE: '无有效赛程/岗位安排', UNKNOWN: '证件号不存在'
+}
+// 纯计算：给定证件、核验点、功能区域与时间（HH:MM，空=当前时间），返回动态权限结论
+function evaluateAccess(cred, { venue_id, zone, direction = 'in', atMin } = {}) {
+  // 离场：任何已签发证件（含停用）均可刷出，避免人员滞留；伪号仍拦截
+  if (direction === 'out') return { ok: true, result: 'PASS_OUT', reason: 'OK', detail: REASON_TEXT.OK, zones: cred ? effectiveZones(cred) : [] }
+  if (!cred) return { ok: false, result: 'DENY', reason: 'UNKNOWN', detail: REASON_TEXT.UNKNOWN }
+  if (cred.status === 'suspended') return { ok: false, result: 'DENY', reason: 'SUSPENDED', detail: cred.suspend_reason ? `证件已停用：${cred.suspend_reason}` : REASON_TEXT.SUSPENDED, zones: effectiveZones(cred) }
+  if (cred.status === 'revoked') return { ok: false, result: 'DENY', reason: 'REVOKED', detail: REASON_TEXT.REVOKED, zones: effectiveZones(cred) }
+  const nowStr = nowDateTimeStr()
+  if (cred.expires_at && String(cred.expires_at) <= nowStr) return { ok: false, result: 'DENY', reason: 'EXPIRED', detail: `${REASON_TEXT.EXPIRED}（${cred.expires_at}）`, zones: effectiveZones(cred) }
+  if (cred.valid_from && String(cred.valid_from) > nowStr) return { ok: false, result: 'DENY', reason: 'NOT_YET', detail: `${REASON_TEXT.NOT_YET}（${cred.valid_from}）`, zones: effectiveZones(cred) }
+
+  const zones = effectiveZones(cred)
+  const venue = get('SELECT * FROM venues WHERE id=?', venue_id)
+  if (!venue) return { ok: false, result: 'DENY', reason: 'VENUE_DENIED', detail: '核验点场地不存在', zones }
+
+  const scopes = buildScopes(cred)
+  if (!scopes.length) return { ok: false, result: 'DENY', reason: 'NO_SCHEDULE', detail: `${REASON_TEXT.NO_SCHEDULE}（资格失效或暂无待赛/排班/当班安排）`, zones }
+  const atVenue = scopes.filter(s => s.venue_id === venue.id)
+  if (!atVenue.length) {
+    const s0 = scopes[0]
+    const vn = s0.venue_id ? get('SELECT name FROM venues WHERE id=?', s0.venue_id)?.name : '未指定场地'
+    return { ok: false, result: 'DENY', reason: 'VENUE_DENIED', detail: `权限场地为「${vn}」，当前核验点为「${venue.name}」`, zones, scopes }
+  }
+  // 时间窗：无固定时刻的范围（田径检录/工作人员当班）全天放行；赛程范围按开赛前 90 分钟 ~ 开赛后 60 分钟
+  const timed = atVenue.filter(s => s.time_label)
+  let scope = atVenue.find(s => !s.time_label) || null
+  if (timed.length) {
+    scope = timed.find(s => { const t = hmToMin(s.time_label); return atMin >= t - PRE_LEAD && atMin <= t + POST_TAIL }) || null
+    if (!scope) {
+      timed.sort((a, b) => Math.abs(hmToMin(a.time_label) - atMin) - Math.abs(hmToMin(b.time_label) - atMin))
+      const near = timed[0]
+      const delta = hmToMin(near.time_label) - atMin
+      const when = delta > 0 ? `距开赛还有 ${delta} 分钟（开赛前 ${PRE_LEAD} 分钟起入场）` : `该场已开赛 ${-delta} 分钟（开赛后 ${POST_TAIL} 分钟停止入场）`
+      return { ok: false, result: 'DENY', reason: 'OUTSIDE_WINDOW', detail: `${REASON_TEXT.OUTSIDE_WINDOW}：${near.title}，${when}`, zones, scopes: atVenue }
+    }
+  }
+  if (zone && !zones.includes(zone)) {
+    return { ok: false, result: 'DENY', reason: 'ZONE_DENIED', detail: `区域「${zone}」未授权（可通行：${zones.join('、')}）`, zones, scope, scopes: atVenue }
+  }
+  return { ok: true, result: 'PASS_IN', reason: 'OK', detail: REASON_TEXT.OK, zones, scope, scopes: atVenue }
+}
+function recordAccess(row) {
+  const r = run(`INSERT INTO access_logs (credential_id,code,holder_type,holder_name,direction,result,reason,venue_id,venue_name,zone,match_id,scope_key,detail,writeback,gate,created_at)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    row.credential_id ?? null, row.code ?? null, row.holder_type ?? null, row.holder_name ?? null,
+    row.direction || 'in', row.result, row.reason ?? null, row.venue_id ?? null, row.venue_name ?? null,
+    row.zone ?? null, row.match_id ?? null, row.scope_key ?? null, row.detail ?? null,
+    row.writeback ? JSON.stringify(row.writeback) : null, row.gate ?? null, row.created_at || nowDateTimeStr())
+  return Number(r.lastInsertRowid)
+}
+// 放行回写：比赛（球队到场）、报名（签到时间）、排班（裁判签到）、检录（田径）、岗位（工作人员）
+function applyCheckinWriteback(cred, scope) {
+  const targets = []
+  const stamp = nowDateTimeStr()
+  if (cred.holder_type === 'team' && scope?.kind === 'match') {
+    const m = get('SELECT * FROM matches WHERE id=?', scope.match_id)
+    const side = m.team_a === cred.holder_id ? 'a' : m.team_b === cred.holder_id ? 'b' : null
+    if (side === 'a') run(`UPDATE matches SET team_a_checked_in=1, team_a_check_at=? WHERE id=?`, stamp, m.id)
+    if (side === 'b') run(`UPDATE matches SET team_b_checked_in=1, team_b_check_at=? WHERE id=?`, stamp, m.id)
+    targets.push({ target: 'match', match_id: m.id, side, label: `比赛到场：${matchTitle(get('SELECT * FROM matches WHERE id=?', m.id))}` })
+  } else if (cred.holder_type === 'athlete') {
+    const r = run(`UPDATE entries SET checked_in=1, check_at=? WHERE athlete_id=? AND sport_id=(SELECT sport_id FROM athletes WHERE id=?)`,
+      stamp, cred.holder_id, cred.holder_id)
+    targets.push({ target: 'entry', athlete_id: cred.holder_id, rows: r.changes, label: `田径检录 ${r.changes} 条成绩档案` })
+  } else if (cred.holder_type === 'referee' && scope?.kind === 'duty') {
+    const a = run(`UPDATE assignments SET checked_in=1, check_at=? WHERE match_id=? AND referee_id=? AND status='assigned'`,
+      stamp, scope.match_id, cred.holder_id)
+    targets.push({ target: 'assignment', match_id: scope.match_id, rows: a.changes, label: `裁判签到：${scope.title}（${ROLE_NAME[scope.role] || '执法'}）` })
+  } else if (cred.holder_type === 'staff') {
+    run(`UPDATE staff SET last_check_at=? WHERE id=?`, stamp, cred.holder_id)
+    targets.push({ target: 'staff', staff_id: cred.holder_id, label: '工作人员到岗' })
+  }
+  if (cred.registration_id) {
+    run(`UPDATE registrations SET credential_id=?, last_check_at=? WHERE id=?`, cred.id, stamp, cred.registration_id)
+    targets.push({ target: 'registration', registration_id: cred.registration_id, label: '报名签到时间回写' })
+  }
+  return targets
+}
+// 闸机核验：实时鉴权 → 留痕 → 放行回写（单事务，幂等防重复入场）
+function performAccessCheck(body) {
+  const code = String(body.code || '').trim().toUpperCase()
+  if (!code) throw new Error('请输入/扫描证件号')
+  const venueId = Number(body.venue_id)
+  if (!venueId) throw new Error('请选择核验点（场地）')
+  const direction = body.direction === 'out' ? 'out' : 'in'
+  const atMin = nowToMin(body.now)
+  const gate = (body.gate || body.operator || '').trim() || null
+
+  return withTransaction(() => {
+    const cred = get('SELECT * FROM credentials WHERE code=?', code) || null
+    const venue = get('SELECT * FROM venues WHERE id=?', venueId)
+    const holderName = cred ? holderNameOf(cred) : null
+    // 重复入场幂等：该证最近一条记录为同范围入场且之后无离场，则放行但不重复回写
+    const last = cred ? get('SELECT * FROM access_logs WHERE credential_id=? ORDER BY id DESC LIMIT 1', cred.id) : null
+    const ev = evaluateAccess(cred, { venue_id: venueId, zone: body.zone ? String(body.zone).trim() : null, direction, atMin })
+
+    let result = ev.result, reason = ev.reason, writeback = null, alreadyIn = false
+    if (ev.ok && direction === 'in' && last && last.result === 'PASS_IN' && last.scope_key === ev.scope?.key) {
+      reason = 'ALREADY_IN'; ev.detail = REASON_TEXT.ALREADY_IN; alreadyIn = true
+    }
+    if (ev.ok && !alreadyIn) writeback = applyCheckinWriteback(cred, ev.scope)
+    if (ev.ok) {
+      const verb = reason === 'ALREADY_IN' ? '重复入场' : direction === 'out' ? '离场' : '入场'
+      ev.detail = `${ev.detail}；${verb}核验通过` + (ev.scope ? `（${ev.scope.title}）` : '')
+    }
+    recordAccess({
+      credential_id: cred?.id, code, holder_type: cred?.holder_type, holder_name: holderName,
+      direction, result, reason, venue_id: venueId, venue_name: venue?.name, zone: body.zone || null,
+      match_id: ev.scope?.match_id ?? null, scope_key: ev.scope?.key ?? (ev.scopes?.[0]?.key ?? null),
+      detail: ev.detail, writeback, gate, created_at: body.created_at
+    })
+    return {
+      ok: ev.ok, result, reason, reason_text: REASON_TEXT[reason] || reason, detail: ev.detail,
+      credential: cred ? { id: cred.id, code: cred.code, holder_type: cred.holder_type, name: holderName, zones: ev.zones || effectiveZones(cred) } : null,
+      venue: venue ? { id: venue.id, name: venue.name } : null,
+      scope: ev.scope ? { key: ev.scope.key, title: ev.scope.title, time_label: ev.scope.time_label || null } : null,
+      writeback, already_in: alreadyIn, at: body.now || `${String(Math.floor(atMin / 60)).padStart(2, '0')}:${String(atMin % 60).padStart(2, '0')}`
+    }
+  })
+}
+function holderNameOf(cred) {
+  if (cred.holder_type === 'team') return get('SELECT name FROM teams WHERE id=?', cred.holder_id)?.name || `队伍#${cred.holder_id}`
+  if (cred.holder_type === 'athlete') return get('SELECT name FROM athletes WHERE id=?', cred.holder_id)?.name || `运动员#${cred.holder_id}`
+  if (cred.holder_type === 'referee') return get('SELECT name FROM referees WHERE id=?', cred.holder_id)?.name || `裁判#${cred.holder_id}`
+  return get('SELECT name FROM staff WHERE id=?', cred.holder_id)?.name || `工作人员#${cred.holder_id}`
+}
+// 为全部已具备资格/在岗但缺证的持证人补签（报名通过时也逐张调用）
+function syncCredentials(kind = 'all', operator = '系统') {
+  const r = { team: 0, athlete: 0, referee: 0, staff: 0 }
+  const issue = (type, holderId, regId) => { const x = issueCredential({ holder_type: type, holder_id: holderId, registration_id: regId, operator }); if (!x.idempotent) r[type]++ }
+  if (kind === 'all' || kind === 'team' || kind === 'athlete') {
+    all(`SELECT * FROM registrations WHERE status='approved' AND kind IN ('team','athlete')`).forEach(reg => {
+      const holderId = reg.kind === 'team' ? reg.team_id : reg.athlete_id
+      if (holderId && !get(`SELECT id FROM credentials WHERE holder_type=? AND holder_id=? AND status<>'revoked'`, reg.kind, holderId)) {
+        issue(reg.kind, holderId, reg.id)
+      }
+    })
+  }
+  if (kind === 'all' || kind === 'referee') {
+    all(`SELECT id FROM referees WHERE status IN ('就绪','在岗')`).forEach(x => {
+      if (!get(`SELECT id FROM credentials WHERE holder_type='referee' AND holder_id=? AND status<>'revoked'`, x.id)) issue('referee', x.id, null)
+    })
+  }
+  if (kind === 'all' || kind === 'staff') {
+    all(`SELECT id FROM staff WHERE status='在岗'`).forEach(x => {
+      if (!get(`SELECT id FROM credentials WHERE holder_type='staff' AND holder_id=? AND status<>'revoked'`, x.id)) issue('staff', x.id, null)
+    })
+  }
+  return { issued: r.team + r.athlete + r.referee + r.staff, detail: r }
+}
+// 证件列表：附带持证人信息与动态权限范围（供前端展示"按赛程动态生效"）
+function joinCredential(c, atMin = null) {
+  const cur = atMin == null ? new Date().getHours() * 60 + new Date().getMinutes() : atMin
+  const zones = effectiveZones(c)
+  const scopes = buildScopes(c)
+  let holder = { id: c.holder_id, name: holderNameOf(c) }
+  if (c.holder_type === 'team') {
+    const t = get(`SELECT t.*, u.name unit, u.color, s.name sport, s.venue sport_venue FROM teams t JOIN units u ON u.id=t.unit_id JOIN sports s ON s.id=t.sport_id WHERE t.id=?`, c.holder_id)
+    holder = { ...holder, ...t }
+  } else if (c.holder_type === 'athlete') {
+    const a = get(`SELECT a.*, u.name unit, u.color, s.name sport, s.venue sport_venue FROM athletes a JOIN units u ON u.id=a.unit_id JOIN sports s ON s.id=a.sport_id WHERE a.id=?`, c.holder_id)
+    holder = { ...holder, ...a }
+  } else if (c.holder_type === 'referee') {
+    holder = { ...holder, ...get(`SELECT * FROM referees WHERE id=?`, c.holder_id) }
+  } else {
+    const st = get(`SELECT st.*, v.name venue_name FROM staff st LEFT JOIN venues v ON v.id=st.venue_id WHERE st.id=?`, c.holder_id)
+    holder = { ...holder, ...st }
+  }
+  const scopeView = scopes.map(s => {
+    const vn = s.venue_id ? get('SELECT name FROM venues WHERE id=?', s.venue_id)?.name : null
+    let open = true
+    if (s.time_label) { const t = hmToMin(s.time_label); open = cur >= t - PRE_LEAD && cur <= t + POST_TAIL }
+    return { key: s.key, title: s.title, venue: vn, time_label: s.time_label || null, role: s.role || null, open_now: open }
+  })
+  return {
+    ...c, zones, holder, type_label: HOLDER_META[c.holder_type].label,
+    scopes: scopeView,
+    open_now: c.status === 'active' && scopeView.some(s => s.open_now)
+  }
+}
+function accessOverview() {
+  const issued = get('SELECT COUNT(*) c FROM credentials').c
+  const active = get(`SELECT COUNT(*) c FROM credentials WHERE status='active'`).c
+  const suspended = get(`SELECT COUNT(*) c FROM credentials WHERE status='suspended'`).c
+  const revoked = get(`SELECT COUNT(*) c FROM credentials WHERE status='revoked'`).c
+  const byType = Object.fromEntries(Object.keys(HOLDER_META).map(t => [
+    t,
+    {
+      issued: get(`SELECT COUNT(*) c FROM credentials WHERE holder_type=?`, t).c,
+      active: get(`SELECT COUNT(*) c FROM credentials WHERE holder_type=? AND status='active'`, t).c
+    }
+  ]))
+  const td = todayDateStr()
+  const todayPass = get(`SELECT COUNT(*) c FROM access_logs WHERE substr(created_at,1,10)=? AND result IN ('PASS_IN','PASS_OUT')`, td).c
+  const todayDeny = get(`SELECT COUNT(*) c FROM access_logs WHERE substr(created_at,1,10)=? AND result='DENY'`, td).c
+  const todayIn = get(`SELECT COUNT(*) c FROM access_logs WHERE substr(created_at,1,10)=? AND result='PASS_IN'`, td).c
+  const pending = get(`SELECT COUNT(*) c FROM access_logs WHERE result='DENY' AND handled=0`).c
+  return {
+    issued, active, suspended, revoked, by_type: byType,
+    today: { pass: todayPass, deny: todayDeny, in: todayIn },
+    pending_exceptions: pending,
+    checkin: {
+      teams: get(`SELECT COUNT(*) c FROM matches WHERE status='scheduled' AND (team_a_checked_in=1 OR team_b_checked_in=1)`).c,
+      referees: get(`SELECT COUNT(*) c FROM assignments a JOIN matches m ON m.id=a.match_id WHERE a.status='assigned' AND m.status='scheduled' AND a.checked_in=1`).c,
+      athletes: get(`SELECT COUNT(*) c FROM entries WHERE checked_in=1`).c,
+      staff: get(`SELECT COUNT(*) c FROM staff WHERE last_check_at IS NOT NULL`).c
+    }
+  }
+}
+
 seed()
 // 启动即对历史库做一次统计修复（幂等，健康库为无操作）
 {
   const r = repairHistoricalStats('系统')
   const fixed = r.duplicate_matches + r.quota_no_fixed + r.entries_cleaned
   if (fixed || r.over_quota.length) console.log('[SPORT] 历史赛程统计修复：', JSON.stringify(r))
+}
+// 为历史库中已具备资格/在岗但缺证的人员补签赛事证件（幂等）
+{
+  const r = syncCredentials('all', '系统')
+  if (r.issued) console.log('[ACCESS] 历史人员补签证件：', JSON.stringify(r.detail))
 }
 
 /* ================= API ================= */
@@ -1801,7 +2168,11 @@ const joinMatch = m => {
     ...m,
     teamA: m.team_a ? get('SELECT id,name,unit_id FROM teams WHERE id=?', m.team_a) : null,
     teamB: m.team_b ? get('SELECT id,name,unit_id FROM teams WHERE id=?', m.team_b) : null,
-    venue: get('SELECT * FROM venues WHERE id=?', m.venue_id) || null
+    venue: get('SELECT * FROM venues WHERE id=?', m.venue_id) || null,
+    arrival: {
+      a: { checked_in: !!m.team_a_checked_in, at: m.team_a_check_at || null },
+      b: { checked_in: !!m.team_b_checked_in, at: m.team_b_check_at || null }
+    }
   }
 }
 app.get('/api/sports', (_, res) => res.json(all('SELECT * FROM sports')))
@@ -2053,6 +2424,119 @@ app.post('/api/appeals/:id/uphold', (req, res) => {
     res.json(r)
   } catch (e) { res.status(400).json({ error: e.message }) }
 })
+/* —— 赛事证件与入场核验 —— */
+app.get('/api/credentials', (req, res) => {
+  const atMin = req.query.now ? nowToMin(req.query.now) : null
+  let rows = all('SELECT * FROM credentials ORDER BY id')
+  if (req.query.status) rows = rows.filter(c => c.status === req.query.status)
+  if (req.query.type) rows = rows.filter(c => c.holder_type === req.query.type)
+  res.json(rows.map(c => joinCredential(c, atMin)))
+})
+// 动态权限预览：指定证件 + 核验点 + 时间，返回实时鉴权结论（不落日志）
+app.get('/api/credentials/:id/access', (req, res) => {
+  const c = get('SELECT * FROM credentials WHERE id=?', Number(req.params.id))
+  if (!c) return res.status(404).json({ error: '证件不存在' })
+  try {
+    const atMin = nowToMin(req.query.now)
+    const ev = evaluateAccess(c, { venue_id: Number(req.query.venue_id), zone: req.query.zone || null, atMin })
+    res.json({ ...ev, reason_text: REASON_TEXT[ev.reason] || ev.reason, credential: joinCredential(c, atMin) })
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
+app.post('/api/credentials/sync', (req, res) => {
+  try { res.json({ ok: true, ...syncCredentials(req.body?.kind || 'all', req.body?.operator || '组委会') }) }
+  catch (e) { res.status(400).json({ error: e.message }) }
+})
+app.post('/api/credentials/:id/suspend', (req, res) => {
+  try {
+    const c = get('SELECT * FROM credentials WHERE id=?', Number(req.params.id))
+    if (!c) return res.status(404).json({ error: '证件不存在' })
+    if (c.status === 'revoked') return res.status(400).json({ error: '已注销证件不能停用' })
+    if (c.status === 'suspended') return res.json({ ok: true, idempotent: true })
+    run(`UPDATE credentials SET status='suspended', suspended_at=datetime('now','localtime'), suspend_reason=? WHERE id=?`,
+      (req.body.reason || '').trim() || '人工停用', c.id)
+    res.json({ ok: true })
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
+app.post('/api/credentials/:id/restore', (req, res) => {
+  const c = get('SELECT * FROM credentials WHERE id=?', Number(req.params.id))
+  if (!c) return res.status(404).json({ error: '证件不存在' })
+  if (c.status !== 'suspended') return res.json({ ok: true, idempotent: true })
+  run(`UPDATE credentials SET status='active', suspended_at=NULL, suspend_reason=NULL WHERE id=?`, c.id)
+  res.json({ ok: true })
+})
+
+// 场地工作人员
+app.get('/api/staff', (_, res) => {
+  res.json(all(`SELECT st.*, v.name venue_name FROM staff st LEFT JOIN venues v ON v.id=st.venue_id ORDER BY st.id`))
+})
+app.post('/api/staff', (req, res) => {
+  try {
+    const name = (req.body.name || '').trim()
+    if (!name) return res.status(400).json({ error: '工作人员姓名不能为空' })
+    const venueId = req.body.venue_id ? Number(req.body.venue_id) : null
+    if (venueId && !get('SELECT id FROM venues WHERE id=?', venueId)) return res.status(400).json({ error: '所属场地不存在' })
+    const r = run('INSERT INTO staff (name,role,venue_id,phone,status) VALUES (?,?,?,?,?)',
+      name, (req.body.role || '场地保障').trim(), venueId, (req.body.phone || '').trim() || null, req.body.status === '离岗' ? '离岗' : '在岗')
+    const id = Number(r.lastInsertRowid)
+    if (req.body.status !== '离岗') issueCredential({ holder_type: 'staff', holder_id: id, operator: req.body.operator || '组委会' })
+    res.json({ ok: true, id })
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
+app.patch('/api/staff/:id', (req, res) => {
+  try {
+    const st = get('SELECT * FROM staff WHERE id=?', Number(req.params.id))
+    if (!st) return res.status(404).json({ error: '工作人员不存在' })
+    const name = req.body.name !== undefined ? String(req.body.name).trim() : st.name
+    const role = req.body.role !== undefined ? String(req.body.role).trim() : st.role
+    const phone = req.body.phone !== undefined ? String(req.body.phone).trim() : st.phone
+    let venueId = st.venue_id
+    if (req.body.venue_id !== undefined) {
+      venueId = req.body.venue_id ? Number(req.body.venue_id) : null
+      if (venueId && !get('SELECT id FROM venues WHERE id=?', venueId)) return res.status(400).json({ error: '所属场地不存在' })
+    }
+    const status = ['在岗', '离岗'].includes(req.body.status) ? req.body.status : st.status
+    run('UPDATE staff SET name=?,role=?,venue_id=?,phone=?,status=? WHERE id=?', name, role || '场地保障', venueId, phone || null, status, st.id)
+    // 离岗 → 证件停用（闸机拦截）；回岗 → 恢复
+    const cred = get(`SELECT * FROM credentials WHERE holder_type='staff' AND holder_id=? AND status<>'revoked' ORDER BY id`, st.id)
+    if (status === '离岗' && cred?.status === 'active') {
+      run(`UPDATE credentials SET status='suspended', suspended_at=datetime('now','localtime'), suspend_reason='工作人员离岗，证件暂停' WHERE id=?`, cred.id)
+    } else if (status === '在岗' && cred?.status === 'suspended') {
+      run(`UPDATE credentials SET status='active', suspended_at=NULL, suspend_reason=NULL WHERE id=?`, cred.id)
+    }
+    res.json({ ok: true })
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
+
+// 闸机/核验点刷卡：实时鉴权 + 全量留痕 + 放行回写
+app.post('/api/access/check', (req, res) => {
+  try { res.json(performAccessCheck(req.body || {})) }
+  catch (e) { res.status(400).json({ error: e.message }) }
+})
+app.get('/api/access/logs', (req, res) => {
+  const limit = Math.min(300, Number(req.query.limit) || 120)
+  let sql = `SELECT * FROM access_logs`
+  const where = [], params = []
+  if (req.query.result === 'deny') where.push(`result='DENY'`)
+  if (req.query.handled === '0') where.push('handled=0')
+  if (req.query.type) { where.push('holder_type=?'); params.push(req.query.type) }
+  if (where.length) sql += ' WHERE ' + where.join(' AND ')
+  sql += ' ORDER BY id DESC LIMIT ?'
+  params.push(limit)
+  const rows = all(sql, ...params).map(l => ({ ...l, writeback: safeParseJson(l.writeback) }))
+  res.json(rows)
+})
+// 异常处置（拦截记录可标记处理结论，异常审计闭环）
+app.post('/api/access/logs/:id/handle', (req, res) => {
+  const l = get('SELECT * FROM access_logs WHERE id=?', Number(req.params.id))
+  if (!l) return res.status(404).json({ error: '核验记录不存在' })
+  if (l.result !== 'DENY') return res.status(400).json({ error: '仅拦截记录需要异常处置' })
+  if (l.handled) return res.json({ ok: true, idempotent: true })
+  run(`UPDATE access_logs SET handled=1, handled_at=datetime('now','localtime'), handled_by=?, handle_note=? WHERE id=?`,
+    (req.body.operator || '安保组') + '', (req.body.note || '').trim() || '现场核实放行', l.id)
+  res.json({ ok: true })
+})
+app.get('/api/access/overview', (_, res) => res.json(accessOverview()))
+
 app.get('/api/quota', (_, res) => {
   const sports = all('SELECT * FROM sports')
   res.json(sports.map(s => {
@@ -2096,6 +2580,7 @@ app.get('/api/overview', (_, res) => {
       reviewing: get(`SELECT COUNT(*) c FROM appeals WHERE status='reviewing'`)?.c || 0,
       upheld: get(`SELECT COUNT(*) c FROM appeals WHERE status='upheld'`)?.c || 0
     },
+    access: accessOverview(),
     sportDone: sp.map(s => ({ ...s, total: mats.filter(m => m.sport_id === s.id).length, done: done.filter(m => m.sport_id === s.id).length })),
     recent: all('SELECT * FROM matches ORDER BY id DESC LIMIT 5').map(joinMatch)
   })
@@ -2107,7 +2592,7 @@ app.post('/api/matches/:id/score', (req, res) => {
   if (m.team_a == null || m.team_b == null) return res.status(400).json({ error: '对阵尚未编排，先编排淘汰赛' })
   const sa = Number(score_a), sb = Number(score_b)
   if (!Number.isInteger(sa) || !Number.isInteger(sb) || sa < 0 || sb < 0) return res.status(400).json({ error: '比分必须为非负整数' })
-  // 录入预警：主裁缺失必须提示；其余执法席位（助理/记录台）缺口同步提示
+  // 录入预警：主裁缺失必须提示；其余执法席位（助理/记录台）缺口同步提示；未入场核验到场同样预警
   const crew = crewRowsOf(m.id)
   const hasChief = crew.some(a => a.role === 'chief')
   const missing = crewMissing(m, crew)
@@ -2115,6 +2600,9 @@ app.post('/api/matches/:id/score', (req, res) => {
   if (!hasChief) warnings.push('该场次未安排主裁')
   if (missing.assistant) warnings.push(`缺助理裁判×${missing.assistant}`)
   if (missing.recorder) warnings.push('缺记录台')
+  if (m.team_a && !m.team_a_checked_in) warnings.push(`${get('SELECT name FROM teams WHERE id=?', m.team_a)?.name || '主队'}未核验入场`)
+  if (m.team_b && !m.team_b_checked_in) warnings.push(`${get('SELECT name FROM teams WHERE id=?', m.team_b)?.name || '客队'}未核验入场`)
+  if (hasChief && !crew.some(a => a.role === 'chief' && a.checked_in)) warnings.push('主裁尚未签到入场')
   try {
     finishMatch(m.id, sa, sb, tb_a, tb_b)
   } catch (e) {
@@ -2129,8 +2617,8 @@ app.post('/api/ko/:sportId', (req, res) => {
 })
 app.post('/api/track/:sportId', (req, res) => {
   try {
-    finishTrack(Number(req.params.sportId), req.body)
-    res.json({ ok: true })
+    const r = finishTrack(Number(req.params.sportId), req.body)
+    res.json({ ok: true, warning: r.warning })
   } catch (e) {
     res.status(400).json({ error: e.message })
   }
@@ -2138,7 +2626,7 @@ app.post('/api/track/:sportId', (req, res) => {
 app.get('/api/reset', (_, res) => {
   // 单事务重置 + 重置后立即执行历史统计修复，保证演示数据口径一致
   withTransaction(() => {
-    ['appeal_logs', 'appeals', 'assignment_logs', 'assignments', 'registrations', 'entries', 'standings', 'medals', 'matches', 'referees', 'venues', 'athletes', 'teams', 'units', 'sports'].forEach(t => { try { run(`DELETE FROM ${t}`) } catch (e) {} })
+    ['appeal_logs', 'appeals', 'assignment_logs', 'assignments', 'registrations', 'entries', 'standings', 'medals', 'matches', 'referees', 'venues', 'athletes', 'teams', 'units', 'sports', 'access_logs', 'credentials', 'staff'].forEach(t => { try { run(`DELETE FROM ${t}`) } catch (e) {} })
     seed()
     repairHistoricalStats('系统')
   })

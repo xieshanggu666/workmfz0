@@ -9,6 +9,7 @@ import RegistrationView from '@/components/RegistrationView.vue'
 import AppealView from '@/components/AppealView.vue'
 import TeamView from '@/components/TeamView.vue'
 import VenueView from '@/components/VenueView.vue'
+import AccessView from '@/components/AccessView.vue'
 import MedalView from '@/components/MedalView.vue'
 import ReportsView from '@/components/ReportsView.vue'
 
@@ -19,12 +20,14 @@ const navs = [
   ['overview', '🏟️', '赛事总览'], ['schedule', '🗓️', '赛程编排'], ['score', '⚡', '成绩录入'],
   ['bracket', '🧩', '对阵积分'], ['registration', '📝', '报名审核'], ['appeal', '⚖️', '申诉复核'],
   ['team', '👥', '队伍运动员'],
-  ['venue', '📍', '场地裁判'], ['medal', '🥇', '奖牌榜'], ['reports', '📊', '报表中心']
+  ['venue', '📍', '场地裁判'], ['access', '🪪', '证件核验'], ['medal', '🥇', '奖牌榜'], ['reports', '📊', '报表中心']
 ]
 const view = ref('overview')
-const cur = { overview: OverviewView, schedule: ScheduleView, score: ScoreView, bracket: BracketView, registration: RegistrationView, appeal: AppealView, team: TeamView, venue: VenueView, medal: MedalView, reports: ReportsView }
+const cur = { overview: OverviewView, schedule: ScheduleView, score: ScoreView, bracket: BracketView, registration: RegistrationView, appeal: AppealView, team: TeamView, venue: VenueView, access: AccessView, medal: MedalView, reports: ReportsView }
 // 待受理 + 复核中 = 组委会待办
 const appealTodo = computed(() => (store.overview?.appeals?.pending || 0) + (store.overview?.appeals?.reviewing || 0))
+// 待处置入场拦截 = 安保待办
+const accessTodo = computed(() => store.accessLogs.filter(l => l.result === 'DENY' && !l.handled).length)
 </script>
 
 <template>
@@ -38,6 +41,7 @@ const appealTodo = computed(() => (store.overview?.appeals?.pending || 0) + (sto
         <button v-for="(n, i) in navs" :key="n[0]" :class="{ active: view === n[0] }" @click="view = n[0]">
           <span class="em">{{ n[1] }}</span>{{ n[2] }}
           <span v-if="n[0] === 'appeal' && appealTodo" class="nav-badge">{{ appealTodo }}</span>
+          <span v-if="n[0] === 'access' && accessTodo" class="nav-badge" style="background:#e5484d">{{ accessTodo }}</span>
         </button>
       </nav>
       <div class="side-foot">

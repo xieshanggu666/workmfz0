@@ -170,6 +170,64 @@ CREATE TABLE IF NOT EXISTS appeal_logs (
   created_at TEXT DEFAULT (datetime('now','localtime'))
 );
 CREATE INDEX IF NOT EXISTS idx_appeal_logs ON appeal_logs(appeal_id);
+
+-- ================= 赛事证件与入场核验 =================
+-- 场地工作人员（安保/医护/器材/场地维护/记录播报）：按所属场地获得动态权限
+CREATE TABLE IF NOT EXISTS staff (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  role TEXT,                       -- 岗位
+  venue_id INTEGER,                -- 所属场地（入场权限范围）
+  phone TEXT,
+  status TEXT DEFAULT '在岗',       -- 在岗 / 离岗
+  created_at TEXT DEFAULT (datetime('now','localtime')),
+  last_check_at TEXT               -- 最近一次入场核验时间（回写）
+);
+-- 赛事证件：参赛队（球类）/运动员（田径单项）/裁判/场地工作人员
+-- 权限不是静态白名单：资格状态、执法排班、赛程时间窗、岗位场地与授权区域在每次核验时实时计算
+CREATE TABLE IF NOT EXISTS credentials (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL UNIQUE,       -- TM-0001 / AT-0001 / RF-0001 / ST-0001
+  holder_type TEXT NOT NULL,       -- team / athlete / referee / staff
+  holder_id INTEGER NOT NULL,
+  registration_id INTEGER,         -- 参赛队/运动员来源报名（裁判与工作人员为空）
+  status TEXT NOT NULL DEFAULT 'active',  -- active(有效) / suspended(停用) / revoked(注销)
+  zones TEXT,                      -- 授权区域 JSON
+  valid_from TEXT,                 -- 生效时间
+  expires_at TEXT,                 -- 失效时间（NULL = 整个赛会期间有效）
+  issued_at TEXT DEFAULT (datetime('now','localtime')),
+  issued_by TEXT,
+  suspend_reason TEXT,
+  suspended_at TEXT,
+  revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_cred_holder ON credentials(holder_type, holder_id);
+-- 入场核验流水（闸机/核验点每次刷卡均留痕，放行与拦截同口径审计）
+CREATE TABLE IF NOT EXISTS access_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  credential_id INTEGER,           -- 未查到证件时为 NULL（伪证/号段错误）
+  code TEXT,                       -- 实际刷卡的证件号（保留原值，含无效号码）
+  holder_type TEXT,
+  holder_name TEXT,
+  direction TEXT DEFAULT 'in',     -- in(入场) / out(离场)
+  result TEXT NOT NULL,            -- PASS_IN / PASS_OUT / DENY
+  reason TEXT,                     -- OK/ALREADY_IN/SUSPENDED/REVOKED/EXPIRED/NOT_YET/ZONE_DENIED/VENUE_DENIED/OUTSIDE_WINDOW/UNKNOWN
+  venue_id INTEGER,
+  venue_name TEXT,
+  zone TEXT,                       -- 申请进入的功能区域
+  match_id INTEGER,                -- 命中的赛程（球队/裁判）
+  scope_key TEXT,                  -- 权限范围键：match:<id> / track:<sport_id> / staff:<venue_id>
+  detail TEXT,                     -- 人类可读核验结论
+  writeback TEXT,                  -- 回写目标 JSON（报名/排班/比赛/检录/岗位）
+  gate TEXT,                       -- 核验点/闸机（操作人）
+  handled INTEGER DEFAULT 0,       -- 异常是否已处置（DENY 行）
+  handled_at TEXT,
+  handled_by TEXT,
+  handle_note TEXT,
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_access_created ON access_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_access_result ON access_logs(result, handled);
 `)
 
 // —— 旧库迁移：补充字段（列已存在则忽略） ——
@@ -189,6 +247,29 @@ try { db.prepare(`ALTER TABLE matches ADD COLUMN note TEXT`).run() } catch (e) {
 })
 // 回填历史已完赛场次的胜方；小组/循环平局 winner 保持 NULL
 db.prepare(`UPDATE matches SET winner = CASE WHEN score_a > score_b THEN team_a WHEN score_b > score_a THEN team_b ELSE NULL END WHERE status='finished' AND winner IS NULL`).run()
+
+// —— 证件入场核验：回写字段迁移（列已存在则忽略） ——
+// 比赛：双方队伍到场状态与到场时间（闸机核验放行时回写）
+;['team_a_checked_in INTEGER DEFAULT 0', 'team_b_checked_in INTEGER DEFAULT 0',
+ 'team_a_check_at TEXT', 'team_b_check_at TEXT'].forEach(def => {
+  const [col, ...rest] = def.split(' ')
+  try { db.prepare(`ALTER TABLE matches ADD COLUMN ${col} ${rest.join(' ')}`).run() } catch (e) { /* 列已存在 */ }
+})
+// 排班：裁判按场次签到（闸机核验放行时回写）
+;['checked_in INTEGER DEFAULT 0', 'check_at TEXT'].forEach(def => {
+  const [col, ...rest] = def.split(' ')
+  try { db.prepare(`ALTER TABLE assignments ADD COLUMN ${col} ${rest.join(' ')}`).run() } catch (e) { /* 列已存在 */ }
+})
+// 田径成绩：赛前检录状态（闸机核验放行时回写）
+;['checked_in INTEGER DEFAULT 0', 'check_at TEXT'].forEach(def => {
+  const [col, ...rest] = def.split(' ')
+  try { db.prepare(`ALTER TABLE entries ADD COLUMN ${col} ${rest.join(' ')}`).run() } catch (e) { /* 列已存在 */ }
+})
+// 报名：关联证件与最近入场时间（核验放行时回写）
+;['credential_id INTEGER', 'last_check_at TEXT'].forEach(def => {
+  const [col, ...rest] = def.split(' ')
+  try { db.prepare(`ALTER TABLE registrations ADD COLUMN ${col} ${rest.join(' ')}`).run() } catch (e) { /* 列已存在 */ }
+})
 
 export function run(sql, ...p) { return db.prepare(sql).run(...p) }
 export function all(sql, ...p) { return db.prepare(sql).all(...p) }

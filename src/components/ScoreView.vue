@@ -78,9 +78,9 @@ async function saveTrack(sid) {
   }
   payload.sort((a, b) => a.mark - b.mark)
   try {
-    await store.saveTrack(sid, payload)
+    const r = await store.saveTrack(sid, payload)
     Object.keys(tr).forEach(k => delete tr[k])
-    toast.value = '✅ 田径成绩已校验并按时间排序结算金/银/铜'
+    toast.value = r?.warning ? '⚠️ ' + r.warning : '✅ 田径成绩已校验并按时间排序结算金/银/铜'
   } catch (e) {
     toast.value = '⚠️ ' + e.message
   }
@@ -120,10 +120,15 @@ const rankCls = r => r === 1 ? '#d99a00' : r === 2 ? '#90a4ae' : r === 3 ? '#c97
           <span class="t" style="text-align:right"><span class="badge">{{ m.teamB?.name }}<span class="dot" :style="{ background: store.unitOfUid(m.teamB?.unit_id)?.color }"></span></span></span>
         </div>
         <div v-if="m.note" class="note-line">📝 {{ m.note }}</div>
+        <!-- 入场核验到场状态（回写自闸机核验） -->
+        <div class="arrive-line">
+          <span class="tag" :class="m.arrival?.a?.checked_in ? 'g' : 'o'">{{ m.arrival?.a?.checked_in ? '✅ ' + m.teamA?.name + '已到场' : '⏳ ' + (m.teamA?.name || '主队') + '未核验' }}</span>
+          <span class="tag" :class="m.arrival?.b?.checked_in ? 'g' : 'o'">{{ m.arrival?.b?.checked_in ? '✅ ' + m.teamB?.name + '已到场' : '⏳ ' + (m.teamB?.name || '客队') + '未核验' }}</span>
+        </div>
         <div class="crew-line">
           <template v-if="store.crewOf(m.id).length">
             <span v-for="a in store.crewOf(m.id)" :key="a.id" class="tag" :class="a.role === 'chief' ? 'b' : 'gray'">
-              {{ a.role === 'chief' ? '🧑‍⚖️ 主裁' : a.role === 'assistant' ? '🚩 助理' : '📋 记录台' }}：{{ a.referee?.name }}
+              {{ a.role === 'chief' ? '🧑‍⚖️ 主裁' : a.role === 'assistant' ? '🚩 助理' : '📋 记录台' }}：{{ a.referee?.name }}<i v-if="a.checked_in" class="ck"> ✅签到</i>
             </span>
           </template>
           <span v-if="m.status==='scheduled' && !store.chiefOf(m.id)" class="tag o">🟠 尚未安排主裁</span>
@@ -152,12 +157,13 @@ const rankCls = r => r === 1 ? '#d99a00' : r === 2 ? '#90a4ae' : r === 3 ? '#c97
       <div class="caption"><span class="badge">🏃 {{ s.name }}</span><span class="hint">按成绩(秒)升序自动排名，前 3 结算金/银/铜</span></div>
       <div class="pad">
         <table>
-          <thead><tr><th>#</th><th>运动员</th><th>单位</th><th>成绩(秒)</th></tr></thead>
+          <thead><tr><th>#</th><th>运动员</th><th>单位</th><th>检录</th><th>成绩(秒)</th></tr></thead>
           <tbody>
             <tr v-for="(e, i) in sortEntries(store.entries.filter(x=>x.sport_id===s.id))" :key="e.id">
               <td><b :style="{ color: rankCls(e.rank), fontSize:'16px' }">{{ e.rank ?? '—' }}</b></td>
               <td>{{ e.aname }}</td>
               <td><span class="badge"><span class="dot" :style="{ background: store.unitOfUid(e.unit_id)?.color }"></span>{{ e.unit }}</span></td>
+              <td><span class="tag" :class="e.checked_in ? 'g' : 'o'">{{ e.checked_in ? '✅ 已检录' : '⏳ 未检录' }}</span></td>
               <td><input :value="getMark(e)" @input="setMark(e, $event)" type="number" step="0.01" min="0.01" placeholder="待录" style="width:90px" /> <span class="tag gray mt8" style="margin-left:6px">s</span></td>
             </tr>
           </tbody>
@@ -175,4 +181,6 @@ const rankCls = r => r === 1 ? '#d99a00' : r === 2 ? '#90a4ae' : r === 3 ? '#c97
 .tbrow { display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 8px; padding: 7px 10px; border-radius: 10px; background: #fff7ed; border: 1px dashed var(--accent); font-size: 12px; color: var(--muted); }
 .note-line { font-size: 12px; color: var(--muted); margin-top: 8px; padding: 5px 9px; background: var(--bg2); border-radius: 8px; }
 .crew-line { margin-top: 8px; }
+.arrive-line { margin-top: 7px; display: flex; gap: 6px; flex-wrap: wrap; }
+.ck { font-style: normal; font-size: 10px; margin-left: 2px; }
 </style>

@@ -48,7 +48,7 @@ function cancelAct() { acting.value = null; note.value = '' }
 async function approve(r) {
   try {
     const res = await store.approveRegistration(r.id)
-    showToast(`✅ 已通过资格审核，占用名额 #${res.quota_no}，已纳入参赛名单${r.kind === 'team' ? '与赛程' : ''}`)
+    showToast(`✅ 已通过资格审核，占用名额 #${res.quota_no}，已签发证件 ${res.credential_code || ''}，已纳入参赛名单${r.kind === 'team' ? '与赛程' : ''}`)
   } catch (e) { showToast('⚠️ ' + e.message) }
 }
 async function reject(r) {
@@ -78,6 +78,8 @@ async function revoke(r) {
 }
 
 const unitColor = uid => store.unitOfUid(uid)?.color || '#ccc'
+// 已通过报名关联的赛事证件（资格审核通过即签发，退报/撤销同步注销）
+const credOf = r => store.credentials.find(c => c.registration_id === r.id)?.code
 </script>
 
 <template>
@@ -169,7 +171,7 @@ const unitColor = uid => store.unitOfUid(uid)?.color || '#ccc'
               <span class="tag" :class="STATUS_META[r.status]?.tag">{{ STATUS_META[r.status]?.text }}</span>
             </div>
             <div class="mrow">
-              <span class="t" style="font-size:15px"><b>{{ r.name }}</b><span v-if="r.quota_no" class="tag y" style="margin-left:8px">名额 #{{ r.quota_no }}</span></span>
+              <span class="t" style="font-size:15px"><b>{{ r.name }}</b><span v-if="r.quota_no" class="tag y" style="margin-left:8px">名额 #{{ r.quota_no }}</span><span v-if="credOf(r)" class="tag b" style="margin-left:6px">🪪 {{ credOf(r) }}</span></span>
               <span class="hint" style="font-size:11px">提交于 {{ r.submitted_at }}</span>
             </div>
             <div v-if="r.review_note" class="note-line">📝 {{ r.review_note }}<span v-if="r.reviewer"> · {{ r.reviewer }}</span><span v-if="r.reviewed_at"> · {{ r.reviewed_at }}</span></div>

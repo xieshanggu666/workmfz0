@@ -23,7 +23,7 @@ event/
 ├── README.md
 ├── server/
 │   ├── db.js                    # SQLite 建表
-│   ├── index.js                 # 编排算法 + 积分/奖牌 + REST API + 种子数据
+│   ├── index.js                 # 编排算法 + 积分/奖牌 + 证件核验 + REST API + 种子数据
 │   └── event.db                 # SQLite 数据库文件
 └── src/
     ├── main.js
@@ -33,12 +33,13 @@ event/
     └── components/
         ├── OverviewView.vue     # 赛事总览
         ├── ScheduleView.vue     # 赛程编排（自动对阵 + 淘汰推进）
-        ├── ScoreView.vue        # 成绩录入
+        ├── ScoreView.vue        # 成绩录入（到场/签到/检录状态）
         ├── BracketView.vue      # 对阵与积分榜
-        ├── RegistrationView.vue # 报名与资格审核（提交/审核/退报/撤销）
+        ├── RegistrationView.vue # 报名与资格审核（提交/审核/退报/撤销，通过即发证）
         ├── AppealView.vue       # 赛事申诉复核（单位异议/受理改判/驳回，联动积分奖牌淘汰赛）
         ├── TeamView.vue         # 队伍与运动员
         ├── VenueView.vue        # 场地与裁判
+        ├── AccessView.vue       # 赛事证件与入场核验（动态权限/闸机核验/异常审计/工作人员）
         ├── MedalView.vue        # 奖牌榜
         └── ReportsView.vue      # 报表中心
 ```
@@ -71,6 +72,10 @@ npm run dev      # 后端 4170 + 前端 5203
 | `registrations` | 参赛报名与资格审核（kind：team/athlete，状态流转 pending→approved/rejected，退报 withdrawn / 撤销 revoked，含名额序号 quota_no、审核人与备注） |
 | `appeals` | 赛事申诉单（编号 SS-xxxx；target_type：match 球类比分 / track 田径成绩 / eligibility 参赛资格；状态 pending 待受理 → reviewing 复核中 → upheld 改判 / rejected 驳回，或 withdrawn 撤案；resolution 与 impact 记录改判结论及影响汇总） |
 | `appeal_logs` | 申诉全量审计（submit/accept/reject/withdraw/uphold，含人类可读详情、变更前后快照 JSON 与经办人，按申诉单串联时间线） |
+| `staff` | 场地工作人员（岗位 role / 所属场地 venue_id / 状态 在岗·离岗 / 最近到岗 last_check_at，离岗自动停用证件） |
+| `credentials` | 赛事证件（TM 参赛队 / AT 运动员 / RF 裁判员 / ST 工作人员；状态 active/suspended/revoked；授权区域 zones；有效期；关联报名 registration_id） |
+| `access_logs` | 入场核验流水（每次刷卡均留痕；PASS_IN/PASS_OUT/DENY + 原因 reason；命中赛程 scope_key；放行回写明细 writeback JSON；拦截异常 handled 处置闭环） |
+| 回写列 | `matches.team_a/b_checked_in`（球队到场）、`assignments.checked_in`（裁判签到）、`entries.checked_in`（田径检录）、`registrations.last_check_at/credential_id`（报名签到） |
 
 ## 核心算法
 
@@ -125,6 +130,28 @@ npm run dev      # 后端 4170 + 前端 5203
 - **等级资质**：等级只能向下兼容（主裁可兼助理/记录台，助理不可当主裁、记录台不可当主裁/助理）；资质不符默认拦截，可强制安排并标记「跨级」。临时调班（改派/同角色对调）同样做专长、等级与冲突预检，对调仅限相同执法角色。
 
 **赛程变更联动整场执法安排**：调整**待赛场次**时间/场地时，系统在单事务中先应用变更、再基于变更后的全局状态检测场地与裁判冲突；默认开启**自动重排**，逐席释放冲突裁判并按专长/等级/负荷自动改派，随后补齐该场主裁/助理/记录台缺口。场地撞场或存在无合格替补的裁判冲突时，整笔改期（场次、排班、自动改派、留痕）**原子回滚**，并补写 `reschedule_rollback` 留痕；仍需强行调整时可选择强制保留冲突并留痕。调整**已完赛场次**时只更正历史时间/场地档案，比分、积分和已归档执法名单不变，且必须填写更正原因；场地视图会区分待赛撞场与历史归档重叠。新生成的淘汰赛/半决赛、循环赛重排的新场次均**自动整场协同排班**（补齐主裁/助理/记录台，无可用裁判的席位留待排班页）；报名通过触发循环赛重排时，旧场次执法安排全部解除并留痕；退报/撤销资格导致的弃权（判 3:0 完赛 → 执法记录归档）与成绩取消（场次 void → 解除在派裁判）均联动；比分录入页与赛程页显示整场名单，录入比分时未派主裁或缺助理/记录台均返回预警；总览页与报表中心展示**已完赛归档 + 待赛排班**合并覆盖率及分待赛/已完赛口径，报表中心同步分角色覆盖率、按角色拆分的执法工作量、场地冲突与最新变更。
+
+## 赛事证件与入场核验（🪪 证件核验页）
+
+为 **参赛队（TM-xxxx）、田径运动员（AT-xxxx）、裁判员（RF-xxxx）、场地工作人员（ST-xxxx）** 四类人员签发赛事证件。权限**不是静态白名单**——每次闸机核验都按「**资格状态 + 赛程时间窗 + 场地 + 执法排班 + 岗位 + 授权区域**」实时计算：
+
+- **参赛队**：资格须为已通过，且当场为本人**待赛场次**；入场窗口为开赛前 90 分钟至开赛后 60 分钟；仅可进入比赛场地的运动员区/热身区。
+- **田径运动员**：资格有效即可在项目场地全天检录，可通行运动员区/检录区/热身区。
+- **裁判员**：须有该场地的**在派待赛执法排班**（含主裁/助理/记录台角色），窗口同赛程；可通行裁判区/比赛区/记录台。
+- **场地工作人员**：按**所属场地**获得当班全天权限（工作区/后勤区）；离岗即停用证件，回岗恢复。
+
+**拦截原因**全量分类留痕：查无此证 UNKNOWN、证件停用 SUSPENDED、证件注销 REVOKED、过期/未生效、场地不符 VENUE_DENIED、区域未授权 ZONE_DENIED、非入场时间窗 OUTSIDE_WINDOW、无赛程/排班 NO_SCHEDULE；放行含重复入场 ALREADY_IN 幂等提示（同范围已在场内不重复回写）与离场 PASS_OUT。每次核验（放行与拦截）都写入 `access_logs`，记录证件号、核验点/区域、结论、命中赛程与回写明细。
+
+**核验结果回写**（与鉴权同处 `BEGIN IMMEDIATE` 单事务）：
+
+| 持证人 | 回写目标 |
+|--------|----------|
+| 参赛队 | `matches.team_a/b_checked_in` 与到场时间（**比赛**）；`registrations.last_check_at`（**报名**签到） |
+| 裁判员 | `assignments.checked_in/check_at`（**排班**按场次签到）；裁判资格来源 |
+| 田径运动员 | `entries.checked_in/check_at`（**检录**）；报名签到 |
+| 工作人员 | `staff.last_check_at`（到岗） |
+
+**全链路联动**：报名审核通过即自动签发证件（响应返回证件号，报名记录回写 `credential_id`）；退报/撤销资格（含申诉改判撤销）**同步注销证件**，闸机即刻拦截；申诉改判/资格变动导致的重赛、递补会重置到场状态；成绩录入对「球队未核验到场、主裁未签到、运动员未检录」给出预警（不阻断结算，田径结算返回未检录名单）；总览页、成绩录入页展示实时到场/签到/检录状态。侧边导航对未处置拦截显示红色角标，**异常审计**页对 DENY 记录提供处置归档（处置人/时间/说明），报表中心输出拦截原因分布与回写/处置审计。另提供 `POST /api/credentials/sync` 为已具备资格但缺证的历史人员幂等补签，服务启动时自动执行一次。
 
 ## 脚本
 

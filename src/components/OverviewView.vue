@@ -38,6 +38,22 @@ function appealBrief(a) {
       <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#22c15e,#7edda4)"></span><span class="ic">⛳</span><b>{{ prog }}%</b><em>整体完成度</em></div>
     </div>
 
+    <!-- 证件与入场核验速览 -->
+    <div class="card mt" v-if="ov.access">
+      <div class="caption">🪪 赛事证件与入场核验 <span class="hint">有效证件 {{ ov.access.active }}/{{ ov.access.issued }} · 今日放行 {{ ov.access.today?.pass || 0 }} · 拦截 {{ ov.access.today?.deny || 0 }} · 待处置异常 {{ ov.access.pending_exceptions }}</span></div>
+      <div class="pad" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+        <span v-for="(meta, t) in ({ team: '🏀 参赛队', athlete: '🏃 运动员', referee: '🧑‍⚖️ 裁判员', staff: '🧰 工作人员' })" :key="t" class="acc-chip">
+          {{ meta }} <b>{{ ov.access.by_type?.[t]?.active || 0 }}</b>/<span class="hint">{{ ov.access.by_type?.[t]?.issued || 0 }}</span>
+        </span>
+        <span style="flex:1"></span>
+        <span class="acc-chip">🏀 球队到场 <b>{{ ov.access.checkin?.teams || 0 }}</b></span>
+        <span class="acc-chip">🧑‍⚖️ 裁判签到 <b>{{ ov.access.checkin?.referees || 0 }}</b></span>
+        <span class="acc-chip">🏃 运动员检录 <b>{{ ov.access.checkin?.athletes || 0 }}</b></span>
+        <span class="acc-chip">🧰 到岗 <b>{{ ov.access.checkin?.staff || 0 }}</b></span>
+        <span class="acc-chip" :class="{ alert: ov.access.pending_exceptions > 0 }">🚨 待处置 <b>{{ ov.access.pending_exceptions }}</b></span>
+      </div>
+    </div>
+
     <!-- 申诉复核速览 -->
     <div class="card mt" v-if="ov.appeals">
       <div class="caption">⚖️ 赛事申诉复核 <span class="hint">待受理 {{ ov.appeals.pending }} · 复核中 {{ ov.appeals.reviewing }} · 已改判 {{ ov.appeals.upheld }} / 共 {{ ov.appeals.total }} 件</span></div>
@@ -113,4 +129,8 @@ function appealBrief(a) {
 
 <style scoped>
 .note-line { font-size: 12px; color: var(--muted); margin-top: 6px; padding: 5px 9px; background: var(--bg2); border-radius: 8px; }
+.acc-chip { background: var(--bg2); border-radius: 20px; padding: 7px 14px; font-size: 13px; font-weight: 600; color: var(--muted); }
+.acc-chip b { color: var(--ink); font-size: 15px; margin: 0 2px; }
+.acc-chip.alert { background: #ffecec; color: #e5484d; }
+.acc-chip.alert b { color: #e5484d; }
 </style>
